@@ -394,7 +394,12 @@ const Views = {
             </aside>
             <main class="main-content">
                 <header class="flex justify-between items-center mb-4">
-                    <h2 class="animate-fade">Dashboard</h2>
+                    <div class="flex items-center gap-4">
+                        <button class="menu-toggle" onclick="Handlers.toggleSidebar()">
+                            <i class='bx bx-menu'></i>
+                        </button>
+                        <h2 class="animate-fade">Dashboard</h2>
+                    </div>
                     <div class="flex items-center gap-4">
                         <button onclick="Wallet.connect()" id="wallet-btn" class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.8rem;">
                             <i class='bx bx-wallet'></i> Connect Wallet
@@ -418,6 +423,10 @@ const Views = {
 // ==========================================
 
 const Handlers = {
+    toggleSidebar: () => {
+        document.querySelector('.sidebar').classList.toggle('active');
+    },
+
     handleLogin: async (e) => {
         e.preventDefault();
         const form = new FormData(e.target);
@@ -707,30 +716,32 @@ Views.adminUsers = () => {
             <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.5rem;">
                 Manage registered users and verified entities.
             </p>
-            <table style="width: 100%; text-align: left; border-collapse: collapse;">
-                <thead>
-                    <tr style="border-bottom: 1px solid var(--glass-border); color: var(--text-muted);">
-                        <th style="padding: 1rem;">Name</th>
-                        <th style="padding: 1rem;">Email</th>
-                        <th style="padding: 1rem;">Role</th>
-                        <th style="padding: 1rem;">Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${users.map(u => `
-                        <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
-                            <td style="padding: 1rem;">${u.name}</td>
-                            <td style="padding: 1rem;">${u.email}</td>
-                            <td style="padding: 1rem;">
-                                <span class="status-badge" style="background: rgba(99,102,241,0.15); color: var(--primary-light);">
-                                    ${u.role}
-                                </span>
-                            </td>
-                            <td style="padding: 1rem; color: var(--success);">Active</td>
+            <div style="overflow-x: auto;">
+                <table style="width: 100%; text-align: left; border-collapse: collapse;">
+                    <thead>
+                        <tr style="border-bottom: 1px solid var(--glass-border); color: var(--text-muted);">
+                            <th style="padding: 1rem;">Name</th>
+                            <th style="padding: 1rem;">Email</th>
+                            <th style="padding: 1rem;">Role</th>
+                            <th style="padding: 1rem;">Status</th>
                         </tr>
-                    `).join('')}
-                </tbody>
-            </table>
+                    </thead>
+                    <tbody>
+                        ${users.map(u => `
+                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
+                                <td style="padding: 1rem;">${u.name}</td>
+                                <td style="padding: 1rem;">${u.email}</td>
+                                <td style="padding: 1rem;">
+                                    <span class="status-badge" style="background: rgba(99,102,241,0.15); color: var(--primary-light);">
+                                        ${u.role}
+                                    </span>
+                                </td>
+                                <td style="padding: 1rem; color: var(--success);">Active</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
         </div>
     `;
 };
@@ -781,15 +792,16 @@ Views.adminOverview = () => {
             </p>
 
             ${pending.length === 0 ? '<p>No pending certificates.</p>' : `
-                <table style="width: 100%; text-align: left; border-collapse: collapse;">
-                    <thead>
-                        <tr style="border-bottom: 1px solid var(--glass-border); color: var(--text-muted);">
-                            <th style="padding: 1rem;">ID</th>
-                            <th style="padding: 1rem;">Student</th>
-                            <th style="padding: 1rem;">Institution</th>
-                            <th style="padding: 1rem;">Actions</th>
-                        </tr>
-                    </thead>
+                <div style="overflow-x: auto;">
+                    <table style="width: 100%; text-align: left; border-collapse: collapse;">
+                        <thead>
+                            <tr style="border-bottom: 1px solid var(--glass-border); color: var(--text-muted);">
+                                <th style="padding: 1rem;">ID</th>
+                                <th style="padding: 1rem;">Student</th>
+                                <th style="padding: 1rem;">Institution</th>
+                                <th style="padding: 1rem;">Actions</th>
+                            </tr>
+                        </thead>
                     <tbody>
                         ${pending.map(c => `
                             <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">

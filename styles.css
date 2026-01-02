@@ -204,17 +204,20 @@ h1, h2, h3, h4, h5, h6 {
     display: grid;
     grid-template-columns: 250px 1fr;
     min-height: 100vh;
+    transition: grid-template-columns 0.3s ease;
 }
 
 .sidebar {
     background: rgba(15, 23, 42, 0.8);
     border-right: 1px solid var(--glass-border);
     padding: 2rem 1.5rem;
+    transition: transform 0.3s ease;
 }
 
 .main-content {
     padding: 2rem;
     overflow-y: auto;
+    width: 100%;
 }
 
 .nav-item {
@@ -260,4 +263,82 @@ h1, h2, h3, h4, h5, h6 {
 .file-upload-zone:hover {
     border-color: var(--primary);
     background: rgba(99, 102, 241, 0.05);
+}
+
+/* Mobile Toggle Button */
+.menu-toggle {
+    display: none;
+    background: transparent;
+    border: none;
+    color: var(--text-main);
+    font-size: 1.5rem;
+    cursor: pointer;
+}
+
+/* Responsive Design */
+@media (max-width: 991px) {
+    .container {
+        padding: 0 15px;
+    }
+    
+    .dashboard-grid {
+        grid-template-columns: 1fr;
+        position: relative;
+    }
+
+    .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 250px;
+        z-index: 100;
+        transform: translateX(-100%);
+        background: var(--bg-dark); /* Ensure solid background for overlay */
+        box-shadow: 5px 0 15px rgba(0,0,0,0.5);
+    }
+
+    .sidebar.active {
+        transform: translateX(0);
+    }
+
+    .menu-toggle {
+        display: block;
+        margin-right: 1rem;
+    }
+
+    /* Specific adjustments for smaller screens */
+    .grid {
+        grid-template-columns: 1fr !important; /* Force single column on mobile */
+    }
+    
+    .glass-card {
+        padding: 1.5rem;
+    }
+
+    /* Table scrolling */
+    table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+}
+
+@media (max-width: 480px) {
+    .glass-card {
+        padding: 1rem;
+    }
+    
+    .btn {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .file-upload-zone {
+        padding: 1.5rem;
+    }
+    
+    h2 {
+        font-size: 1.5rem;
+    }
 }
