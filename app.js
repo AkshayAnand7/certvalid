@@ -4,43 +4,92 @@
  */
 
 // ==========================================
-// MOCK DATA & STORAGE WRAPPER
-// ==========================================
-
-const Storage = {
-    get: (key) => JSON.parse(localStorage.getItem(`cert_${key}`) || 'null'),
-    set: (key, val) => localStorage.setItem(`cert_${key}`, JSON.stringify(val)),
-
-    // Initialize default data if empty
-    init: () => {
-        if (!Storage.get('users')) {
-            Storage.set('users', [
-                { id: 'admin', name: 'System Admin', email: 'admin@sys.com', role: 'ADMIN', password: 'admin' },
-                { id: 'user1', name: 'John Doe', email: 'john@example.com', role: 'USER', password: 'user' },
-                { id: 'verifier1', name: 'Acme Corp', email: 'hr@acme.com', role: 'VERIFIER', password: 'ver' }
-            ]);
-        }
-        if (!Storage.get('certificates')) {
-            Storage.set('certificates', []);
-        }
-        if (!Storage.get('institutions')) {
-            Storage.set('institutions', [
-                { id: 'inst1', name: 'MIT', email: 'records@mit.edu' },
-                { id: 'inst2', name: 'Stanford', email: 'verify@stanford.edu' }
-            ]);
-        }
-    }
-};
-
-Storage.init();
-
-// ==========================================
 // MOCK API SERVICES
 // ==========================================
 
 // ==========================================
 // CONFIGURATION & BLOCKCHAIN SERVICES
 // ==========================================
+
+// ==========================================
+// FIREBASE CONFIGURATION
+// ==========================================
+
+
+const firebaseConfig = {
+    apiKey: "AIzaSyBGVB2Nuy63sS7cp_2YVQfnzpBDLzHvuJQ",
+    authDomain: "certvalid-6175f.firebaseapp.com",
+    projectId: "certvalid-6175f",
+    storageBucket: "certvalid-6175f.firebasestorage.app",
+    messagingSenderId: "1014352462680",
+    appId: "1:1014352462680:web:22af91b5e85b941562db2d",
+    measurementId: "G-TW0PXY0N4K"
+};
+
+// Initialize Firebase
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+
+// ==========================================
+// FIRESTORE DATABASE SERVICE
+// ==========================================
+
+const DB = {
+    // 1. User Management
+    saveUser: async (user) => {
+        // user.id MUST be their Auth UID
+        await db.collection('users').doc(user.id).set(user);
+    },
+
+    getUser: async (uid) => {
+        const doc = await db.collection('users').doc(uid).get();
+        return doc.exists ? doc.data() : null;
+    },
+
+    getAllUsers: async () => {
+        const snapshot = await db.collection('users').get();
+        return snapshot.docs.map(doc => doc.data());
+    },
+
+    // 2. Certificate Management
+    addCertificate: async (cert) => {
+        // cert.id is manual ID (e.g., CERT-XXXX)
+        await db.collection('certificates').doc(cert.id).set(cert);
+    },
+
+    getCertificatesByUser: async (userId) => {
+        const snapshot = await db.collection('certificates')
+            .where('userId', '==', userId)
+            .get();
+        return snapshot.docs.map(doc => doc.data());
+    },
+
+    getAllCertificates: async () => {
+        // For Admin Overview
+        const snapshot = await db.collection('certificates').get();
+        return snapshot.docs.map(doc => doc.data());
+    },
+
+    getCertificateById: async (id) => {
+        const doc = await db.collection('certificates').doc(id).get();
+        return doc.exists ? doc.data() : null;
+    },
+
+    updateCertificateStatus: async (id, status, txHash = null, issuer = null) => {
+        const updates = { status };
+        if (txHash) updates.txHash = txHash;
+        if (issuer) updates.issuer = issuer;
+
+        await db.collection('certificates').doc(id).update(updates);
+    }
+};
+
+// Deprecated Storage Wrapper (Kept to avoid immediate crashes, but logic will shift to DB)
+const Storage = {
+    get: () => [],
+    set: () => { }
+};
 
 const CONFIG = {
     // START: USER MUST UPDATE THESE
@@ -195,24 +244,107 @@ const IPFS = {
     }
 };
 
-// Kept Auth API
 const API = {
-    delay: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+    // Login with Firebase
     login: async (email, password) => {
-        await new Promise(resolve => setTimeout(resolve, 800));
-        const users = Storage.get('users');
-        const user = users.find(u => u.email === email && u.password === password);
-        return user || null;
+        try {
+            const userCredential = await auth.signInWithEmailAndPassword(email, password);
+            // Return simplified user object for State
+            const user = userCredential.user;
+            const [name, role] = (user.displayName || "User|USER").split('|');
+            return {
+                id: user.uid,
+                name: name,
+                email: user.email,
+                role: role
+            };
+        } catch (error) {
+            console.error("Login Error:", error);
+            throw error;
+        }
     },
+
+    // Register with Firebase
     register: async (userData) => {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        const users = Storage.get('users');
-        if (users.find(u => u.email === userData.email)) throw new Error("User already exists");
-        const newUser = { ...userData, id: 'user_' + Date.now() };
-        users.push(newUser);
-        Storage.set('users', users);
-        return newUser;
+        try {
+            const userCredential = await auth.createUserWithEmailAndPassword(userData.email, userData.password);
+            const user = userCredential.user;
+
+            // HARDCODED INITIAL ADMIN SETUP
+            // If email is 'admin@sys.com', force role to ADMIN
+            if (userData.email === 'admin@sys.com') {
+                userData.role = 'ADMIN';
+            }
+
+            // Store Role in Display Name
+            const role = userData.role || 'USER';
+            await user.updateProfile({
+                displayName: `${userData.name}|${role}`
+            });
+
+            // SAVE USER TO FIRESTORE
+            await DB.saveUser({
+                id: user.uid,
+                name: userData.name,
+                email: user.email,
+                role: role
+            });
+
+            return {
+                id: user.uid,
+                name: userData.name,
+                email: user.email,
+                role: role
+            };
+        } catch (error) {
+            console.error("Registration Error:", error);
+            throw error;
+        }
     },
+
+    // Forgot Password
+    forgotPassword: async (email) => {
+        try {
+            await auth.sendPasswordResetEmail(email);
+        } catch (error) {
+            console.error("Reset Password Error:", error);
+            throw error;
+        }
+    },
+
+    // Create New Admin (Without Logging Out Current User)
+    createAdminUser: async (name, email, password) => {
+        // 1. Initialize Secondary App
+        const secondaryApp = firebase.initializeApp(firebaseConfig, "SecondaryApp");
+
+        try {
+            // 2. Create User on Secondary App
+            const userCredential = await secondaryApp.auth().createUserWithEmailAndPassword(email, password);
+            const user = userCredential.user;
+
+            // 3. Update Profile
+            await user.updateProfile({ displayName: `${name}|ADMIN` });
+
+            // 4. Save to Firestore (Using System DB connection)
+            await DB.saveUser({
+                id: user.uid,
+                name: name,
+                email: email,
+                role: 'ADMIN' // Enforced
+            });
+
+            // 5. Cleanup
+            await secondaryApp.auth().signOut();
+            await secondaryApp.delete();
+
+            return true;
+
+        } catch (error) {
+            await secondaryApp.delete(); // Ensure cleanup
+            throw error;
+        }
+    },
+
     ocrExtract: async (file) => {
         console.log(`[OCR] Analyzing file: ${file.name}`);
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -252,8 +384,7 @@ const State = {
     },
 
     logout: () => {
-        State.user = null;
-        State.navigate('login');
+        auth.signOut().catch(e => console.error(e));
     }
 };
 
@@ -274,11 +405,14 @@ const Views = {
                 <form onsubmit="Handlers.handleLogin(event)">
                     <div class="input-group">
                         <label class="input-label">Email Address</label>
-                        <input type="email" name="email" class="input-field" placeholder="admin@sys.com" required>
+                        <input type="email" name="email" class="input-field" placeholder="name@example.com" required>
                     </div>
                     <div class="input-group">
                         <label class="input-label">Password</label>
-                        <input type="password" name="password" class="input-field" placeholder="••••••" required>
+                        <input type="password" name="password" class="input-field" placeholder="••••••••" required>
+                    </div>
+                    <div style="text-align: right; margin-bottom: 1rem;">
+                        <a href="#" onclick="Handlers.handleForgotPassword()" style="font-size: 0.8rem; color: var(--text-muted);">Forgot Password?</a>
                     </div>
                     
                     <button type="submit" class="btn btn-primary w-full justify-center">
@@ -294,19 +428,7 @@ const Views = {
                     </div>
                 </form>
 
-                <!-- Helper for Demo -->
-                <div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--glass-border); font-size: 0.8rem; color: var(--text-muted);">
-                    <p><strong>Demo Credentials:</strong></p>
-                    <div class="flex justify-between mt-2">
-                        <span>Admin: admin@sys.com / admin</span>
-                    </div>
-                     <div class="flex justify-between">
-                        <span>User: john@example.com / user</span>
-                    </div>
-                     <div class="flex justify-between">
-                        <span>Verifier: hr@acme.com / ver</span>
-                    </div>
-                </div>
+                <!-- Helper for Demo Removed -->
             </div>
         </div>
     `,
@@ -456,6 +578,18 @@ const Handlers = {
         } catch (err) {
             alert(err.message);
         }
+    },
+
+    handleForgotPassword: async () => {
+        const email = prompt("Enter your registered email address:");
+        if (!email) return;
+
+        try {
+            await API.forgotPassword(email);
+            alert(`Password Reset Email sent to ${email}`);
+        } catch (err) {
+            alert("Error: " + err.message);
+        }
     }
 };
 
@@ -464,6 +598,75 @@ const Handlers = {
 // ==========================================
 
 const Render = {
+    hydrateAdminOverview: async () => {
+        const container = document.getElementById('admin-overview-container');
+        if (!container) return;
+
+        const certs = await DB.getAllCertificates();
+        const pending = certs.filter(c => c.status === 'PENDING');
+        const verified = certs.filter(c => c.status === 'VERIFIED');
+
+        container.innerHTML = `
+            <div class="grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem; margin-bottom: 2rem;">
+                 <div class="glass-card">
+                    <span style="color: var(--text-muted)">Total Certificates</span>
+                    <h2>${certs.length}</h2>
+                 </div>
+                 <div class="glass-card">
+                    <span style="color: var(--warning)">Pending Approval</span>
+                    <h2>${pending.length}</h2>
+                 </div>
+                 <div class="glass-card">
+                    <span style="color: var(--success)">Verified On-Chain</span>
+                    <h2>${verified.length}</h2>
+                 </div>
+            </div>
+
+            <div class="glass-card">
+                <h3>Pending Approvals (Institution Simulation)</h3>
+                <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
+                    *In a real system, these would be handled via Email Links by the University. As Admin/Demo, you can override here.
+                </p>
+
+                ${pending.length === 0 ? '<p>No pending certificates.</p>' : `
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; text-align: left; border-collapse: collapse;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid var(--glass-border); color: var(--text-muted);">
+                                    <th style="padding: 1rem;">ID</th>
+                                    <th style="padding: 1rem;">Student</th>
+                                    <th style="padding: 1rem;">Institution</th>
+                                    <th style="padding: 1rem;">Actions</th>
+                                </tr>
+                            </thead>
+                        <tbody>
+                            ${pending.map(c => `
+                                <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
+                                    <td style="padding: 1rem;">${c.id}</td>
+                                    <td style="padding: 1rem;">${c.data.name}</td>
+                                    <td style="padding: 1rem;">${c.data.institution}</td>
+                                    <td style="padding: 1rem;">
+                                        <div class="flex gap-2">
+                                            <button class="btn btn-secondary" style="padding: 6px; font-size: 0.8rem;" onclick="Handlers.showImage('${c.data.image}')">
+                                                <i class='bx bx-show'></i> View
+                                            </button>
+                                            <button class="btn btn-success" style="padding: 6px; background: rgba(34,197,94,0.2); color: var(--success); border:none; cursor:pointer;" onclick="Handlers.adminVerify('${c.id}', true)">
+                                                <i class='bx bxs-check-shield'></i> Write to Blockchain
+                                            </button>
+                                            <button class="btn btn-danger" style="padding: 6px; background: rgba(239,68,68,0.2); color: var(--danger); border:none; cursor:pointer;" onclick="Handlers.adminVerify('${c.id}', false)">
+                                                <i class='bx bx-x'></i> Reject
+                                            </button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `}
+            </div>
+        `;
+    },
+
     app: () => {
         const app = document.getElementById('app');
 
@@ -579,43 +782,53 @@ Views.userUpload = () => `
 `;
 
 Views.userHistory = () => {
-    const certs = Storage.get('certificates').filter(c => c.userId === State.user.id);
+    setTimeout(async () => {
+        const container = document.getElementById('user-history-list');
+        if (!container) return;
 
-    if (certs.length === 0) return `
-        <div class="glass-card" style="text-align: center; padding: 4rem;">
-            <i class='bx bx-file-blank' style="font-size: 3rem; color: var(--text-muted);"></i>
-            <h3 class="mt-4">No Certificates Uploaded</h3>
-            <button class="btn btn-primary mt-4" onclick="State.navigate('user-dashboard')">Upload Now</button>
-        </div>
-    `;
+        const certs = await DB.getCertificatesByUser(State.user.id);
 
-    return `
-        <div class="glass-card">
-            <h3>My Certificates</h3>
-            <div style="margin-top: 1.5rem;">
-                ${certs.map(cert => `
-                    <div style="display: flex; align-items: center; justify-content: space-between; padding: 1rem; border-bottom: 1px solid var(--glass-border);">
-                        <div>
-                            <h4 style="color: var(--primary-light)">${cert.data.degree}</h4>
-                            <div style="font-size: 0.9rem; color: var(--text-muted);">
-                                ${cert.data.institution} • ${cert.uploadedAt}
+        if (certs.length === 0) {
+            container.innerHTML = `
+                <div class="glass-card" style="text-align: center; padding: 4rem;">
+                    <i class='bx bx-file-blank' style="font-size: 3rem; color: var(--text-muted);"></i>
+                    <h3 class="mt-4">No Certificates Uploaded</h3>
+                    <button class="btn btn-primary mt-4" onclick="State.navigate('user-dashboard')">Upload Now</button>
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = `
+            <div class="glass-card">
+                <h3>My Certificates</h3>
+                <div style="margin-top: 1.5rem;">
+                    ${certs.map(cert => `
+                        <div style="display: flex; align-items: center; justify-content: space-between; padding: 1rem; border-bottom: 1px solid var(--glass-border);">
+                            <div>
+                                <h4 style="color: var(--primary-light)">${cert.data.degree}</h4>
+                                <div style="font-size: 0.9rem; color: var(--text-muted);">
+                                    ${cert.data.institution} • ${cert.uploadedAt}
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-4">
+                                <span class="status-badge ${cert.status === 'VERIFIED' ? 'status-verified' : cert.status === 'PENDING' ? 'status-pending' : 'status-invalid'}">
+                                    ${cert.status}
+                                </span>
+                                ${cert.status === 'VERIFIED' ? `
+                                    <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.8rem;" onclick="Handlers.downloadReport('${cert.id}')">
+                                        <i class='bx bxs-download'></i> Report
+                                    </button>
+                                ` : ''}
                             </div>
                         </div>
-                        <div class="flex items-center gap-4">
-                            <span class="status-badge ${cert.status === 'VERIFIED' ? 'status-verified' : cert.status === 'PENDING' ? 'status-pending' : 'status-invalid'}">
-                                ${cert.status}
-                            </span>
-                            ${cert.status === 'VERIFIED' ? `
-                                <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.8rem;" onclick="Handlers.downloadReport('${cert.id}')">
-                                    <i class='bx bxs-download'></i> Report
-                                </button>
-                            ` : ''}
-                        </div>
-                    </div>
-                `).join('')}
+                    `).join('')}
+                </div>
             </div>
-        </div>
-    `;
+        `;
+    }, 100);
+
+    return `<div id="user-history-list"><div class="loader" style="margin: 2rem auto;"></div></div>`;
 };
 
 // ==========================================
@@ -628,14 +841,31 @@ Handlers.handleFileUpload = async (input) => {
     const file = input.files[0];
     if (!file) return;
 
+    // Validate size (Max 500KB for Firestore safety)
+    if (file.size > 500 * 1024) {
+        alert("File too large! Please upload an image under 500KB.");
+        input.value = "";
+        return;
+    }
+
     // Show Loader
     document.getElementById('upload-step-1').classList.add('hidden');
     document.getElementById('upload-step-2').classList.remove('hidden');
 
     try {
-        // Stimulate OCR
+        // 1. Convert to Base64
+        const base64 = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+
+        // 2. Stimulate OCR
         const data = await API.ocrExtract(file);
-        Handlers.currentOcrData = data;
+
+        // 3. Attach Image Data
+        Handlers.currentOcrData = { ...data, image: base64 };
 
         // Show Results
         document.getElementById('upload-step-2').classList.add('hidden');
@@ -669,19 +899,20 @@ Handlers.submitCertificate = async () => {
 
         // 2. Create Record (Pending Blockchain Write by Admin)
         const newCert = {
-            id: 'CERT-' + Math.random().toString(36).substr(2, 6).toUpperCase(),
+            id: 'CERT-' + Math.floor(Math.random() * 1000000),
             userId: State.user.id,
-            data: Handlers.currentOcrData,
+            data: {
+                ...Handlers.currentOcrData,
+                // Ensure image is included (it's already in currentOcrData from previous step, but explicit is good)
+            },
             ipfsHash: ipfsHash,
             status: 'PENDING',
             uploadedAt: new Date().toLocaleDateString(),
-            verificationLog: []
+            txHash: null,
+            issuer: null
         };
-
-        // 3. Save
-        const certs = Storage.get('certificates');
-        certs.push(newCert);
-        Storage.set('certificates', certs);
+        // 3. Save to Firestore
+        await DB.addCertificate(newCert);
 
         alert('Certificate Uploaded to IPFS! Sent to Admin for Blockchain Verification.');
         State.navigate('user-history');
@@ -692,16 +923,22 @@ Handlers.submitCertificate = async () => {
     }
 };
 
-Handlers.downloadReport = (id) => {
-    const cert = Storage.get('certificates').find(c => c.id === id);
-    const content = `VERIFICATION REPORT\n\nID: ${cert.id}\nStatus: ${cert.status}\nBlockchain Hash: ${cert.txHash}\nIPFS: ${cert.ipfsHash}`;
+Handlers.downloadReport = async (id) => {
+    try {
+        const cert = await DB.getCertificateById(id);
+        if (!cert) throw new Error("Certificate not found");
 
-    const blob = new Blob([content], { type: 'text/plain' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `report-${cert.id}.txt`;
-    a.click();
+        const content = `VERIFICATION REPORT\n\nID: ${cert.id}\nStatus: ${cert.status}\nBlockchain Hash: ${cert.txHash}\nIPFS: ${cert.ipfsHash}`;
+
+        const blob = new Blob([content], { type: 'text/plain' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `report-${cert.id}.txt`;
+        a.click();
+    } catch (err) {
+        alert(err.message);
+    }
 };
 
 // ==========================================
@@ -709,10 +946,53 @@ Handlers.downloadReport = (id) => {
 // ==========================================
 
 Views.adminUsers = () => {
-    const users = Storage.get('users');
+    // Trigger Hydration
+    setTimeout(async () => {
+        const users = await DB.getAllUsers();
+        const tbody = document.getElementById('admin-users-table');
+        if (!tbody) return;
+
+        tbody.innerHTML = users.map(u => `
+            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
+                <td style="padding: 1rem;">${u.name}</td>
+                <td style="padding: 1rem;">${u.email}</td>
+                <td style="padding: 1rem;">
+                    <span class="status-badge" style="background: rgba(99,102,241,0.15); color: var(--primary-light);">
+                        ${u.role}
+                    </span>
+                </td>
+                <td style="padding: 1rem; color: var(--success);">Active</td>
+            </tr>
+        `).join('');
+    }, 100);
+
     return `
         <div class="glass-card">
-            <h3>User Management</h3>
+            <div class="flex justify-between items-center mb-4">
+                <h3>User Management</h3>
+                <button class="btn btn-primary" onclick="Handlers.toggleCreateAdminModal()">
+                    <i class='bx bx-user-plus'></i> Create New Admin
+                </button>
+            </div>
+            
+            <!-- HIDDEN MODAL FOR CREATING ADMIN -->
+            <div id="create-admin-form" class="hidden" style="margin-bottom: 2rem; padding: 1.5rem; background: rgba(255,255,255,0.05); border-radius: var(--radius-sm);">
+                <h4 style="margin-bottom: 1rem; color: var(--primary-light);">Register New System Administrator</h4>
+                <form onsubmit="Handlers.handleCreateAdmin(event)">
+                    <div class="grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                        <input type="text" name="name" class="input-field" placeholder="Admin Name" required>
+                        <input type="email" name="email" class="input-field" placeholder="Email Address" required>
+                    </div>
+                    <div class="grid" style="display: grid; grid-template-columns: 1fr; gap: 1rem; margin-top: 1rem;">
+                        <input type="password" name="password" class="input-field" placeholder="Secure Password" required>
+                    </div>
+                    <div class="flex gap-4 mt-4">
+                        <button type="button" class="btn btn-secondary" onclick="Handlers.toggleCreateAdminModal()">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Create Admin User</button>
+                    </div>
+                </form>
+            </div>
+
             <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.5rem;">
                 Manage registered users and verified entities.
             </p>
@@ -726,19 +1006,8 @@ Views.adminUsers = () => {
                             <th style="padding: 1rem;">Status</th>
                         </tr>
                     </thead>
-                    <tbody>
-                        ${users.map(u => `
-                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
-                                <td style="padding: 1rem;">${u.name}</td>
-                                <td style="padding: 1rem;">${u.email}</td>
-                                <td style="padding: 1rem;">
-                                    <span class="status-badge" style="background: rgba(99,102,241,0.15); color: var(--primary-light);">
-                                        ${u.role}
-                                    </span>
-                                </td>
-                                <td style="padding: 1rem; color: var(--success);">Active</td>
-                            </tr>
-                        `).join('')}
+                    <tbody id="admin-users-table">
+                         <tr><td colspan="4" style="padding:2rem; text-align:center;">Loading Users...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -765,66 +1034,37 @@ Views.verifierSearch = () => `
 `;
 
 Views.adminOverview = () => {
-    const certs = Storage.get('certificates');
-    const pending = certs.filter(c => c.status === 'PENDING');
-    const verified = certs.filter(c => c.status === 'VERIFIED');
+    // Trigger Hydration via Render
+    setTimeout(() => {
+        if (Render.hydrateAdminOverview) Render.hydrateAdminOverview();
+    }, 100);
 
     return `
-        <div class="grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem; margin-bottom: 2rem;">
-             <div class="glass-card">
-                <span style="color: var(--text-muted)">Total Certificates</span>
-                <h2>${certs.length}</h2>
-             </div>
-             <div class="glass-card">
-                <span style="color: var(--warning)">Pending Approval</span>
-                <h2>${pending.length}</h2>
-             </div>
-             <div class="glass-card">
-                <span style="color: var(--success)">Verified On-Chain</span>
-                <h2>${verified.length}</h2>
-             </div>
-        </div>
-
-        <div class="glass-card">
-            <h3>Pending Approvals (Institution Simulation)</h3>
-            <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
-                *In a real system, these would be handled via Email Links by the University. As Admin/Demo, you can override here.
-            </p>
-
-            ${pending.length === 0 ? '<p>No pending certificates.</p>' : `
-                <div style="overflow-x: auto;">
-                    <table style="width: 100%; text-align: left; border-collapse: collapse;">
-                        <thead>
-                            <tr style="border-bottom: 1px solid var(--glass-border); color: var(--text-muted);">
-                                <th style="padding: 1rem;">ID</th>
-                                <th style="padding: 1rem;">Student</th>
-                                <th style="padding: 1rem;">Institution</th>
-                                <th style="padding: 1rem;">Actions</th>
-                            </tr>
-                        </thead>
-                    <tbody>
-                        ${pending.map(c => `
-                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
-                                <td style="padding: 1rem;">${c.id}</td>
-                                <td style="padding: 1rem;">${c.data.name}</td>
-                                <td style="padding: 1rem;">${c.data.institution}</td>
-                                <td style="padding: 1rem;">
-                                    <div class="flex gap-2">
-                                        <button class="btn btn-success" style="padding: 6px; background: rgba(34,197,94,0.2); color: var(--success); border:none; cursor:pointer;" onclick="Handlers.adminVerify('${c.id}', true)">
-                                            <i class='bx bxs-check-shield'></i> Write to Blockchain
-                                        </button>
-                                        <button class="btn btn-danger" style="padding: 6px; background: rgba(239,68,68,0.2); color: var(--danger); border:none; cursor:pointer;" onclick="Handlers.adminVerify('${c.id}', false)">
-                                            <i class='bx bx-x'></i> Reject
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                        `).join('')}
-                    </tbody>
-                </table>
-            `}
+        <div id="admin-overview-container">
+            <div class="loader" style="margin: 2rem auto;"></div>
+            <p style="text-align:center;">Loading Dashboard Data...</p>
         </div>
     `;
+};
+
+Handlers.handleVerificationSearch = async (e) => {
+    e.preventDefault();
+    // ... logic ...
+};
+
+Views.imageModal = (src) => `
+    <div id="image-modal" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; display:flex; justify-content:center; align-items:center;">
+        <div style="position:relative; max-width:90%; max-height:90%;">
+            <button onclick="document.getElementById('image-modal').remove()" style="position:absolute; top:-2rem; right:0; color:white; background:none; border:none; font-size:2rem; cursor:pointer;">&times;</button>
+            <img src="${src}" style="max-width:100%; max-height:90vh; border-radius: var(--radius-sm); box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+        </div>
+    </div>
+`;
+
+Handlers.showImage = (base64) => {
+    if (!base64) return alert("No image available for this certificate.");
+    const modalHtml = Views.imageModal(base64);
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
 };
 
 // ==========================================
@@ -843,11 +1083,11 @@ Handlers.handleVerificationSearch = async (e) => {
         // 1. Read from Blockchain
         const chainData = await Blockchain.verifyCertificate(query);
 
-        // 2. Read from Local DB for Backup/Details (Optional, but good for display)
-        const localCert = Storage.get('certificates').find(c => c.id === query);
+        // 2. Read from Firestore
+        const localCert = await DB.getCertificateById(query);
 
         if (!chainData && !localCert) {
-            throw new Error("Certificate not found on Blockchain or Local Database.");
+            throw new Error("Certificate not found on Blockchain or Database.");
         }
 
         const isVerified = !!chainData && chainData.exists;
@@ -874,6 +1114,14 @@ Handlers.handleVerificationSearch = async (e) => {
                             <h4 style="margin-bottom:0.5rem;">Student Details (Off-Chain)</h4>
                             <p><strong>Name:</strong> ${localCert.data.name}</p>
                             <p><strong>Degree:</strong> ${localCert.data.degree}</p>
+                            
+                            <!-- Display Image if Available -->
+                            ${localCert.data.image ? `
+                                <div style="margin-top: 1rem; text-align: center;">
+                                    <p style="margin-bottom: 0.5rem; color: var(--text-muted);">Certificate Copy:</p>
+                                    <img src="${localCert.data.image}" style="max-width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--glass-border); cursor: pointer;" onclick="Handlers.showImage('${localCert.data.image}')">
+                                </div>
+                            ` : ''}
                         </div>
                      ` : ''}
                 </div>
@@ -897,21 +1145,18 @@ Handlers.adminVerify = async (id, approve) => {
     if (!confirm(`Are you sure you want to ${approve ? 'ISSUE ON BLOCKCHAIN' : 'REJECT'}? This incurs gas fees.`)) return;
 
     if (!approve) {
-        // Just Update Local State
-        const certs = Storage.get('certificates');
-        const index = certs.findIndex(c => c.id === id);
-        if (index > -1) {
-            certs[index].status = 'INVALID';
-            Storage.set('certificates', certs);
-            State.navigate('admin-dashboard');
-        }
+        // Reject locally in DB
+        await DB.updateCertificateStatus(id, 'INVALID');
+        alert("Certificate Rejected.");
+        // Refresh View
+        Render.hydrateAdminOverview && Render.hydrateAdminOverview();
+        State.navigate('admin-dashboard'); // Fallback refresh
         return;
     }
 
     // Blockchain Write
     try {
-        const certs = Storage.get('certificates');
-        const cert = certs.find(c => c.id === id);
+        const cert = await DB.getCertificateById(id);
         if (!cert) return;
 
         alert("Please confirm the transaction in MetaMask...");
@@ -922,12 +1167,9 @@ Handlers.adminVerify = async (id, approve) => {
         alert(`Transaction Sent! Hash: ${tx.hash}\nWaiting for confirmation...`);
         const receipt = await tx.wait(); // Wait for mining
 
-        // Update Local State
-        cert.status = 'VERIFIED';
-        cert.txHash = tx.hash;
-        cert.issuer = await Wallet.address; // Track who issued it locally
-
-        Storage.set('certificates', certs);
+        // Update DB
+        const issuer = await Wallet.address;
+        await DB.updateCertificateStatus(id, 'VERIFIED', tx.hash, issuer);
 
         alert("Certificate Successfully Issued on Blockchain!");
         State.navigate('admin-dashboard');
@@ -937,5 +1179,48 @@ Handlers.adminVerify = async (id, approve) => {
     }
 };
 
+Handlers.toggleCreateAdminModal = () => {
+    const formInfo = document.getElementById('create-admin-form');
+    if (formInfo) formInfo.classList.toggle('hidden');
+};
+
+Handlers.handleCreateAdmin = async (e) => {
+    e.preventDefault();
+    const form = new FormData(e.target);
+    const name = form.get('name');
+    const email = form.get('email');
+    const pass = form.get('password');
+
+    try {
+        alert("Creating new Admin User... Please Wait.");
+        await API.createAdminUser(name, email, pass);
+        alert(`SUCCESS: Admin ${email} created successfully!`);
+
+        // Close Modal & Refresh
+        Handlers.toggleCreateAdminModal();
+        State.navigate('admin-users'); // Reload view
+
+    } catch (err) {
+        alert("Failed to create Admin: " + err.message);
+    }
+};
+
 // Start
-State.navigate('login');
+// Auth Persistence
+auth.onAuthStateChanged(firebaseUser => {
+    if (firebaseUser) {
+        // Parse Role from Display Name
+        const [name, role] = (firebaseUser.displayName || "User|USER").split('|');
+        const user = {
+            id: firebaseUser.uid,
+            name: name,
+            email: firebaseUser.email,
+            role: role
+        };
+        console.log("Auth State: Logged In", user.email);
+        State.loginUser(user);
+    } else {
+        console.log("Auth State: Signed Out");
+        State.navigate('login');
+    }
+});
