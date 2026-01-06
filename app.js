@@ -54,26 +54,57 @@ const DB = {
 
     // 2. Certificate Management
     addCertificate: async (cert) => {
-        // cert.id is manual ID (e.g., CERT-XXXX)
-        await db.collection('certificates').doc(cert.id).set(cert);
+        try {
+            // Try Firestore with strict timeout
+            const savePromise = db.collection('certificates').doc(cert.id).set(cert);
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000));
+            await Promise.race([savePromise, timeoutPromise]);
+        } catch (err) {
+            console.warn("Firestore failed, using LocalStorage:", err);
+            // Fallback to LocalStorage
+            const localCerts = JSON.parse(localStorage.getItem('local_certs') || '[]');
+            localCerts.push(cert);
+            localStorage.setItem('local_certs', JSON.stringify(localCerts));
+        }
     },
 
     getCertificatesByUser: async (userId) => {
-        const snapshot = await db.collection('certificates')
-            .where('userId', '==', userId)
-            .get();
-        return snapshot.docs.map(doc => doc.data());
+        let firestoreData = [];
+        try {
+            const snapshot = await db.collection('certificates').where('userId', '==', userId).get();
+            firestoreData = snapshot.docs.map(doc => doc.data());
+        } catch (err) { console.warn("Firestore read failed, checking LocalStorage"); }
+
+        // Merge with LocalStorage
+        const localCerts = JSON.parse(localStorage.getItem('local_certs') || '[]');
+        const userLocalCerts = localCerts.filter(c => c.userId === userId);
+
+        // Return combined unique list (by ID)
+        const combined = [...firestoreData, ...userLocalCerts];
+        return Array.from(new Map(combined.map(item => [item.id, item])).values());
     },
 
     getAllCertificates: async () => {
-        // For Admin Overview
-        const snapshot = await db.collection('certificates').get();
-        return snapshot.docs.map(doc => doc.data());
+        let firestoreData = [];
+        try {
+            const snapshot = await db.collection('certificates').get();
+            firestoreData = snapshot.docs.map(doc => doc.data());
+        } catch (e) { }
+
+        const localCerts = JSON.parse(localStorage.getItem('local_certs') || '[]');
+        const combined = [...firestoreData, ...localCerts];
+        return Array.from(new Map(combined.map(item => [item.id, item])).values());
     },
 
     getCertificateById: async (id) => {
-        const doc = await db.collection('certificates').doc(id).get();
-        return doc.exists ? doc.data() : null;
+        try {
+            const doc = await db.collection('certificates').doc(id).get();
+            if (doc.exists) return doc.data();
+        } catch (e) { }
+
+        // Fallback
+        const localCerts = JSON.parse(localStorage.getItem('local_certs') || '[]');
+        return localCerts.find(c => c.id === id) || null;
     },
 
     updateCertificateStatus: async (id, status, txHash = null, issuer = null) => {
@@ -81,7 +112,17 @@ const DB = {
         if (txHash) updates.txHash = txHash;
         if (issuer) updates.issuer = issuer;
 
-        await db.collection('certificates').doc(id).update(updates);
+        try {
+            await db.collection('certificates').doc(id).update(updates);
+        } catch (e) { console.warn("Using LocalStorage for update"); }
+
+        // Update LocalStorage
+        const localCerts = JSON.parse(localStorage.getItem('local_certs') || '[]');
+        const index = localCerts.findIndex(c => c.id === id);
+        if (index !== -1) {
+            localCerts[index] = { ...localCerts[index], ...updates };
+            localStorage.setItem('local_certs', JSON.stringify(localCerts));
+        }
     }
 };
 
@@ -170,14 +211,19 @@ const Wallet = {
 
 const Blockchain = {
     getContract: (withSigner = false) => {
-        if (!CONFIG.CONTRACT_ADDRESS || CONFIG.CONTRACT_ADDRESS.includes("0x0000")) {
-            throw new Error("Contract Address not set! Please deploy contract and update CONFIG in app.js");
+        if (withSigner) {
+            if (!Wallet.signer) {
+                throw new Error("Signer required but wallet not connected");
+            }
+            return new ethers.Contract(CONFIG.CONTRACT_ADDRESS, CONTRACT_ABI, Wallet.signer);
         }
-        const provider = withSigner
-            ? Wallet.signer
-            : READ_ONLY_PROVIDER;
 
-        return new ethers.Contract(CONFIG.CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+        // ALWAYS read-only for verifier/public
+        return new ethers.Contract(
+            CONFIG.CONTRACT_ADDRESS,
+            CONTRACT_ABI,
+            READ_ONLY_PROVIDER
+        );
     },
 
     writeCertificate: async (id, hash, issuerName) => {
@@ -194,12 +240,11 @@ const Blockchain = {
 
     verifyCertificate: async (id) => {
         try {
-            // Attempt to use wallet provider if connected, else public.
-            // Note: Public RPCs might fail due to rate limits/CORS in browser. 
-            // Fallback: Propagate error to UI to ask user to connect wallet if read fails.
-            const contract = Blockchain.getContract(false);
+            const contract = Blockchain.getContract(false); // force read-only
             const data = await contract.verifyCertificate(id);
+
             if (!data.exists) return null;
+
             return {
                 ipfsHash: data.ipfsHash,
                 issuerName: data.issuerName,
@@ -208,8 +253,7 @@ const Blockchain = {
                 exists: data.exists
             };
         } catch (err) {
-            console.error("Verification Error:", err);
-            throw err;
+            throw new Error("Blockchain RPC unavailable. Please try again later.");
         }
     }
 };
@@ -223,6 +267,9 @@ const IPFS = {
             return "Qm" + Math.random().toString(36).substr(2, 10) + "MockHash";
         }
 
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s Timeout
+
         const url = `https://api.pinata.cloud/pinning/pinJSONToIPFS`;
         try {
             const response = await fetch(url, {
@@ -232,14 +279,42 @@ const IPFS = {
                     'pinata_api_key': CONFIG.PINATA_API_KEY,
                     'pinata_secret_api_key': CONFIG.PINATA_SECRET_KEY
                 },
-                body: JSON.stringify(jsonData)
+                body: JSON.stringify(jsonData),
+                signal: controller.signal
             });
+            clearTimeout(timeoutId);
             const result = await response.json();
             if (result.error) throw new Error(result.error);
             return result.IpfsHash;
         } catch (err) {
+            clearTimeout(timeoutId);
             console.error("IPFS Upload Failed", err);
+            if (err.name === 'AbortError') {
+                throw new Error("IPFS Upload Timed Out. Please check your internet connection.");
+            }
             throw new Error("IPFS Upload Failed: " + err.message);
+        }
+    },
+
+    fetch: async (hash) => {
+        try {
+            // Fallback Gateways in case one fails
+            const gateways = [
+                `https://gateway.pinata.cloud/ipfs/${hash}`,
+                `https://ipfs.io/ipfs/${hash}`,
+                `https://dweb.link/ipfs/${hash}`
+            ];
+
+            for (const url of gateways) {
+                try {
+                    const response = await fetch(url);
+                    if (response.ok) return await response.json();
+                } catch (e) { console.warn("Gateway failed:", url); }
+            }
+            throw new Error("Could not fetch data from IPFS");
+        } catch (err) {
+            console.error("IPFS Fetch Error:", err);
+            return null; // Return null gracefully
         }
     }
 };
@@ -345,17 +420,64 @@ const API = {
         }
     },
 
-    ocrExtract: async (file) => {
-        console.log(`[OCR] Analyzing file: ${file.name}`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        return {
-            name: "John Doe",
-            registerNumber: "CS2025" + Math.floor(Math.random() * 9000),
-            institution: "MIT",
-            degree: "B.Sc Computer Science",
-            year: "2024",
-            gpa: "3.8"
-        };
+    ocrExtract: async (imageInput) => {
+        console.log(`[OCR] Analyzing image...`);
+
+        if (!window.Tesseract) {
+            console.warn("Tesseract.js not loaded. Please check internet connection.");
+            return { name: "", registerNumber: "", institution: "", degree: "" };
+        }
+
+        try {
+            // Tesseract.js Worker
+            const { data: { text } } = await Tesseract.recognize(
+                imageInput,
+                'eng',
+                { logger: m => console.log(`[OCR] ${m.status}: ${Math.round(m.progress * 100)}%`) }
+            );
+
+            console.log("OCR Raw Text:", text);
+            const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 2);
+
+            // Helper: Find line containing keyword and strip label
+            const extractField = (keywords) => {
+                const line = lines.find(l => keywords.some(k => l.toLowerCase().includes(k)));
+                if (!line) return "";
+                // Remove label (e.g., "Name: John" -> "John")
+                return line.replace(new RegExp(`^.*(${keywords.join('|')})[^:]*:?\\s*`, 'i'), '').trim();
+            };
+
+            // Heuristic Parsing
+            const name = extractField(['name', 'student']);
+            const reg = extractField(['register', 'reg no', 'id number', 'enrollment']);
+            const inst = extractField(['institution', 'university', 'college', 'institute']);
+            const degree = extractField(['degree', 'bachelor', 'master', 'outcome', 'programme']);
+
+            // If empty, user will fill it.
+            const result = {
+                name: name || "",
+                registerNumber: reg || "",
+                institution: inst || "",
+                degree: degree || "",
+                year: new Date().getFullYear().toString(),
+                gpa: ""
+            };
+
+            if (!name || !degree) {
+                alert("OCR finished but some fields are missing. Please manually enter/correct the details.");
+            } else {
+                // Optional: Confirm success
+                // console.log("OCR Success");
+            }
+
+            return result;
+
+        } catch (err) {
+            console.error("OCR Error:", err);
+            // Show specific error (often NetworkError for language data)
+            alert("OCR Failed: " + (err.message || "Unknown Error") + "\n\nPlease manually enter the correct details in the form.");
+            return { name: "", registerNumber: "", institution: "", degree: "" };
+        }
     }
 };
 
@@ -523,9 +645,11 @@ const Views = {
                         <h2 class="animate-fade">Dashboard</h2>
                     </div>
                     <div class="flex items-center gap-4">
+                    ${State.user?.role === 'ADMIN' ? `
                         <button onclick="Wallet.connect()" id="wallet-btn" class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.8rem;">
                             <i class='bx bx-wallet'></i> Connect Wallet
                         </button>
+                    ` : ''}
                         <span style="color: var(--text-muted)">Welcome, ${State.user?.name || 'Guest'}</span>
                         <div style="width: 40px; height: 40px; background: var(--primary); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold;">
                             ${State.user?.name ? State.user.name.charAt(0) : 'G'}
@@ -710,7 +834,9 @@ const Render = {
                                 <i class='bx bxs-cube-alt' style="font-size: 2rem; color: var(--primary);"></i>
                                 <h2>CertValid Public</h2>
                             </div>
-                            <button onclick="State.navigate('login')" class="btn btn-secondary">Login</button>
+                            <div class="flex gap-4">
+                                <button onclick="State.navigate('login')" class="btn btn-secondary">Login</button>
+                            </div>
                         </header>
                         ${Views.verifierSearch()}
                     </div>
@@ -754,25 +880,25 @@ Views.userUpload = () => `
                 <div class="grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
                     <div>
                         <label class="input-label">Student Name</label>
-                        <input type="text" id="ocr-name" class="input-field" readonly>
+                        <input type="text" id="ocr-name" class="input-field">
                     </div>
                     <div>
                         <label class="input-label">Register Number</label>
-                        <input type="text" id="ocr-reg" class="input-field" readonly>
+                        <input type="text" id="ocr-reg" class="input-field">
                     </div>
                     <div>
                         <label class="input-label">Institution</label>
-                        <input type="text" id="ocr-inst" class="input-field" readonly>
+                        <input type="text" id="ocr-inst" class="input-field">
                     </div>
                     <div>
                         <label class="input-label">Degree</label>
-                        <input type="text" id="ocr-degree" class="input-field" readonly>
+                        <input type="text" id="ocr-degree" class="input-field">
                     </div>
                 </div>
                 
                 <div class="mt-8 flex gap-4">
                     <button class="btn btn-secondary w-full justify-center" onclick="Handlers.resetUpload()">Cancel</button>
-                    <button class="btn btn-primary w-full justify-center" onclick="Handlers.submitCertificate()">
+                    <button class="btn btn-primary w-full justify-center" onclick="Handlers.submitCertificate(event)">
                         <i class='bx bx-check-shield'></i> Submit for Verification
                     </button>
                 </div>
@@ -862,7 +988,7 @@ Handlers.handleFileUpload = async (input) => {
         });
 
         // 2. Stimulate OCR
-        const data = await API.ocrExtract(file);
+        const data = await API.ocrExtract(base64);
 
         // 3. Attach Image Data
         Handlers.currentOcrData = { ...data, image: base64 };
@@ -887,31 +1013,51 @@ Handlers.resetUpload = () => {
 };
 
 
-Handlers.submitCertificate = async () => {
+Handlers.submitCertificate = async (event) => {
+    if (event) event.preventDefault();
     if (!Handlers.currentOcrData) return;
-    const btn = event.target;
-    const originalText = btn.innerHTML;
-    btn.innerHTML = `<div class="loader" style="width: 16px; height: 16px; border-width: 2px;"></div> Uploading IPFS...`;
+
+    // 1. Capture potentially edited values from UI
+    const name = document.getElementById('ocr-name').value;
+    const reg = document.getElementById('ocr-reg').value;
+    const inst = document.getElementById('ocr-inst').value;
+    const degree = document.getElementById('ocr-degree').value;
+
+    // Update the data object to be uploaded
+    const dataToUpload = {
+        ...Handlers.currentOcrData,
+        name: name,
+        registerNumber: reg,
+        institution: inst,
+        degree: degree
+    };
+
+    const btn = document.querySelector('#upload-step-3 .btn-primary');
+    const originalText = btn ? btn.innerHTML : "Submit for Verification";
+
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = `<div class="loader" style="width: 16px; height: 16px; border-width: 2px;"></div> Uploading IPFS...`;
+    }
 
     try {
-        // 1. IPFS Upload
-        const ipfsHash = await IPFS.upload(Handlers.currentOcrData);
+        // 2. IPFS Upload
+        const ipfsHash = await IPFS.upload(dataToUpload);
 
-        // 2. Create Record (Pending Blockchain Write by Admin)
+        if (btn) btn.innerHTML = `<div class="loader" style="width: 16px; height: 16px; border-width: 2px;"></div> Saving to DB...`;
+
+        // 3. Create Record (Pending Blockchain Write by Admin)
         const newCert = {
             id: 'CERT-' + Math.floor(Math.random() * 1000000),
             userId: State.user.id,
-            data: {
-                ...Handlers.currentOcrData,
-                // Ensure image is included (it's already in currentOcrData from previous step, but explicit is good)
-            },
+            data: { ...dataToUpload },
             ipfsHash: ipfsHash,
             status: 'PENDING',
             uploadedAt: new Date().toLocaleDateString(),
             txHash: null,
             issuer: null
         };
-        // 3. Save to Firestore
+        // 4. Save to Firestore
         await DB.addCertificate(newCert);
 
         alert('Certificate Uploaded to IPFS! Sent to Admin for Blockchain Verification.');
@@ -919,7 +1065,11 @@ Handlers.submitCertificate = async () => {
 
     } catch (err) {
         alert("Submission Failed: " + err.message);
-        btn.innerHTML = originalText;
+    } finally {
+        if (btn) {
+            btn.innerHTML = originalText;
+            btn.disabled = false;
+        }
     }
 };
 
@@ -1047,10 +1197,7 @@ Views.adminOverview = () => {
     `;
 };
 
-Handlers.handleVerificationSearch = async (e) => {
-    e.preventDefault();
-    // ... logic ...
-};
+
 
 Views.imageModal = (src) => `
     <div id="image-modal" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; display:flex; justify-content:center; align-items:center;">
@@ -1083,49 +1230,53 @@ Handlers.handleVerificationSearch = async (e) => {
         // 1. Read from Blockchain
         const chainData = await Blockchain.verifyCertificate(query);
 
-        // 2. Read from Firestore
-        const localCert = await DB.getCertificateById(query);
-
-        if (!chainData && !localCert) {
-            throw new Error("Certificate not found on Blockchain or Database.");
+        if (!chainData || !chainData.exists) {
+            throw new Error("Certificate not found on Blockchain.");
         }
 
-        const isVerified = !!chainData && chainData.exists;
+        // 2. Fetch Details from IPFS (No Firestore)
+        resultDiv.innerHTML = `<div class="loader" style="margin: 0 auto;"></div><p style="text-align:center; margin-top:10px;">Blockchain Verified! Fetching Metadata from IPFS...</p>`;
+
+        let ipfsData = null;
+        if (chainData.ipfsHash) {
+            ipfsData = await IPFS.fetch(chainData.ipfsHash);
+        }
+
+        const isVerified = true;
 
         resultDiv.innerHTML = `
-            <div style="padding: 2rem; background: ${isVerified ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)'}; border: 1px solid ${isVerified ? 'var(--success)' : 'var(--danger)'}; border-radius: var(--radius-md);">
+            <div style="padding: 2rem; background: rgba(34,197,94,0.1); border: 1px solid var(--success); border-radius: var(--radius-md);">
                 <div class="flex items-center gap-4 mb-4">
-                    <i class='bx ${isVerified ? 'bxs-badge-check' : 'bxs-x-circle'}' style="font-size: 3rem; color: ${isVerified ? 'var(--success)' : 'var(--danger)'}"></i>
+                    <i class='bx bxs-badge-check' style="font-size: 3rem; color: var(--success)"></i>
                     <div>
-                        <h3>${isVerified ? 'Valid Certificate' : 'Invalid / Pending'}</h3>
-                        <p>${isVerified ? 'Authenticity Confirmed via Ethereum Blockchain' : 'Certificate not found on-chain.'}</p>
+                        <h3>Valid Certificate</h3>
+                        <p>Authenticity Confirmed via Ethereum Blockchain</p>
                     </div>
                 </div>
                 
-                ${isVerified ? `
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 2rem; font-size: 0.95rem;">
-                     <div><strong>Issuer Name:</strong> ${chainData.issuerName}</div>
-                     <div><strong>Issuer Address:</strong> <span style="font-family:monospace; font-size:0.8rem;">${chainData.issuerAddress}</span></div>
-                     <div><strong>Issued At:</strong> ${chainData.issuedAt}</div>
-                     <div><strong>IPFS Hash:</strong> <span style="font-family:monospace; font-size:0.8rem;">${chainData.ipfsHash}</span></div>
-                     
-                     ${localCert ? `
+                        <div><strong>Issuer Name:</strong> ${chainData.issuerName}</div>
+                        <div><strong>Issuer Address:</strong> <span style="font-family:monospace; font-size:0.8rem;">${chainData.issuerAddress}</span></div>
+                        <div><strong>Issued At:</strong> ${chainData.issuedAt}</div>
+                        <div><strong>IPFS Hash:</strong> <span style="font-family:monospace; font-size:0.8rem;">${chainData.ipfsHash}</span></div>
+                        
+                        ${ipfsData ? `
                         <div style="grid-column: span 2; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--glass-border);">
-                            <h4 style="margin-bottom:0.5rem;">Student Details (Off-Chain)</h4>
-                            <p><strong>Name:</strong> ${localCert.data.name}</p>
-                            <p><strong>Degree:</strong> ${localCert.data.degree}</p>
+                            <h4 style="margin-bottom:0.5rem;">Student Details (From IPFS)</h4>
+                            <p><strong>Name:</strong> ${ipfsData.name || 'N/A'}</p>
+                            <p><strong>Degree:</strong> ${ipfsData.degree || 'N/A'}</p>
+                            <p><strong>Institution:</strong> ${ipfsData.institution || 'N/A'}</p>
                             
                             <!-- Display Image if Available -->
-                            ${localCert.data.image ? `
+                            ${ipfsData.image ? `
                                 <div style="margin-top: 1rem; text-align: center;">
                                     <p style="margin-bottom: 0.5rem; color: var(--text-muted);">Certificate Copy:</p>
-                                    <img src="${localCert.data.image}" style="max-width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--glass-border); cursor: pointer;" onclick="Handlers.showImage('${localCert.data.image}')">
+                                    <img src="${ipfsData.image}" style="max-width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--glass-border); cursor: pointer;" onclick="Handlers.showImage('${ipfsData.image}')">
                                 </div>
                             ` : ''}
                         </div>
-                     ` : ''}
+                        ` : '<div style="grid-column: span 2; margin-top:1rem; color:var(--warning);"><i>Details could not be loaded from IPFS (Hash might be invalid or timed out).</i></div>'}
                 </div>
-                ` : ''}
             </div>
         `;
 
@@ -1135,7 +1286,6 @@ Handlers.handleVerificationSearch = async (e) => {
                 <i class='bx bxs-error-circle' style="font-size: 2rem;"></i>
                 <h4>Verification Failed</h4>
                 <p>${err.message}</p>
-                <button class="btn btn-secondary mt-2" onclick="Wallet.connect().then(()=>Handlers.handleVerificationSearch(e))">Connect Wallet & Retry</button>
             </div>
         `;
     }
@@ -1172,6 +1322,8 @@ Handlers.adminVerify = async (id, approve) => {
         await DB.updateCertificateStatus(id, 'VERIFIED', tx.hash, issuer);
 
         alert("Certificate Successfully Issued on Blockchain!");
+        // Force refresh
+        await Render.hydrateAdminOverview();
         State.navigate('admin-dashboard');
 
     } catch (err) {
