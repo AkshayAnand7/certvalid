@@ -148,17 +148,40 @@ const DB = {
         if (txHash) updates.txHash = txHash;
         if (issuer) updates.issuer = issuer;
 
+        console.log(`[DB] Updating certificate ${id} status to ${status}`);
+
+        // Try Firestore first
+        let firestoreSuccess = false;
         try {
             await db.collection('certificates').doc(id).update(updates);
-        } catch (e) { console.warn("Using LocalStorage for update"); }
+            console.log(`[DB] Firestore update successful for ${id}`);
+            firestoreSuccess = true;
+        } catch (e) {
+            console.warn("[DB] Firestore update failed:", e.message);
+        }
 
-        // Update LocalStorage
+        // ALWAYS update LocalStorage (as fallback/sync)
         const localCerts = JSON.parse(localStorage.getItem('local_certs') || '[]');
         const index = localCerts.findIndex(c => c.id === id);
         if (index !== -1) {
+            // Update existing
             localCerts[index] = { ...localCerts[index], ...updates };
-            localStorage.setItem('local_certs', JSON.stringify(localCerts));
+            console.log(`[DB] LocalStorage updated for ${id}`);
+        } else if (!firestoreSuccess) {
+            // If not in LocalStorage AND Firestore failed, we need to fetch and store
+            console.warn(`[DB] Certificate ${id} not in LocalStorage, attempting to sync`);
+            try {
+                const doc = await db.collection('certificates').doc(id).get();
+                if (doc.exists) {
+                    const cert = { ...doc.data(), ...updates };
+                    localCerts.push(cert);
+                    console.log(`[DB] Synced ${id} from Firestore to LocalStorage`);
+                }
+            } catch (e) {
+                console.error("[DB] Failed to sync from Firestore");
+            }
         }
+        localStorage.setItem('local_certs', JSON.stringify(localCerts));
     }
 };
 
@@ -512,6 +535,49 @@ const API = {
     ocrExtract: async (imageInput) => {
         console.log(`[OCR] Analyzing image...`);
 
+        // Configuration - Update this URL for production deployment
+        const PADDLE_OCR_URL = 'http://localhost:5000/ocr';
+
+        // Try PaddleOCR Backend First
+        try {
+            console.log("[OCR] Trying PaddleOCR backend...");
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+            const response = await fetch(PADDLE_OCR_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: imageInput }),
+                signal: controller.signal
+            });
+
+            clearTimeout(timeoutId);
+
+            if (response.ok) {
+                const result = await response.json();
+                console.log("[OCR] PaddleOCR Success:", result);
+
+                if (!result.name && !result.degree) {
+                    alert("OCR finished but some fields are missing. Please manually enter/correct the details.");
+                }
+
+                return {
+                    name: result.name || "",
+                    registerNumber: result.registerNumber || "",
+                    institution: result.institution || "",
+                    degree: result.degree || "",
+                    year: result.year || new Date().getFullYear().toString(),
+                    gpa: result.gpa || ""
+                };
+            }
+        } catch (err) {
+            console.warn("[OCR] PaddleOCR backend unavailable, falling back to Tesseract.js:", err.message);
+        }
+
+        // Fallback to Tesseract.js
+        console.log("[OCR] Using Tesseract.js fallback...");
+
         if (!window.Tesseract) {
             console.warn("Tesseract.js not loaded. Please check internet connection.");
             return { name: "", registerNumber: "", institution: "", degree: "" };
@@ -554,16 +620,12 @@ const API = {
 
             if (!name || !degree) {
                 alert("OCR finished but some fields are missing. Please manually enter/correct the details.");
-            } else {
-                // Optional: Confirm success
-                // console.log("OCR Success");
             }
 
             return result;
 
         } catch (err) {
             console.error("OCR Error:", err);
-            // Show specific error (often NetworkError for language data)
             alert("OCR Failed: " + (err.message || "Unknown Error") + "\n\nPlease manually enter the correct details in the form.");
             return { name: "", registerNumber: "", institution: "", degree: "" };
         }
