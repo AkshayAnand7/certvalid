@@ -3,10 +3,9 @@ service cloud.firestore {
   match /databases/{database}/documents {
     
     // Helper function to check if user is admin
-    // Note: In a real app, you'd use custom claims. 
-    // Here we check if the user's email matches the known admin email.
+    // Allow any user with @sys.com email to be treated as admin
     function isAdmin() {
-      return request.auth != null && request.auth.token.email == 'admin@sys.com';
+      return request.auth != null && request.auth.token.email.matches('.*@sys[.]com$');
     }
 
     // USERS COLLECTION
