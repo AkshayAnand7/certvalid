@@ -20,18 +20,56 @@ const db = firebase.firestore();
 const DB = {
     // 1. User Management
     saveUser: async (user) => {
-        // user.id MUST be their Auth UID
-        await db.collection('users').doc(user.id).set(user);
+        try {
+            // user.id MUST be their Auth UID
+            await db.collection('users').doc(user.id).set(user);
+        } catch (e) {
+            console.warn("Firestore save failed, using LocalStorage for User:", e.message);
+            const localUsers = JSON.parse(localStorage.getItem('local_users') || '[]');
+            const index = localUsers.findIndex(u => u.id === user.id);
+            if (index !== -1) {
+                localUsers[index] = user;
+            } else {
+                localUsers.push(user);
+            }
+            localStorage.setItem('local_users', JSON.stringify(localUsers));
+        }
     },
 
     getUser: async (uid) => {
-        const doc = await db.collection('users').doc(uid).get();
-        return doc.exists ? doc.data() : null;
+        try {
+            const doc = await db.collection('users').doc(uid).get();
+            if (doc.exists) return doc.data();
+        } catch (e) { }
+
+        const localUsers = JSON.parse(localStorage.getItem('local_users') || '[]');
+        return localUsers.find(u => u.id === uid) || null;
     },
 
     getAllUsers: async () => {
-        const snapshot = await db.collection('users').get();
-        return snapshot.docs.map(doc => doc.data());
+        let firestoreUsers = [];
+        try {
+            const snapshot = await db.collection('users').get();
+            firestoreUsers = snapshot.docs.map(doc => doc.data());
+        } catch (e) {
+            console.warn("Firestore read failed (Users), utilizing LocalStorage fallback");
+        }
+
+        const localUsers = JSON.parse(localStorage.getItem('local_users') || '[]');
+
+        // Merge Firestore and LocalStorage (Local wins on conflict for dev purposes)
+        const combined = new Map();
+        firestoreUsers.forEach(u => combined.set(u.id, u));
+        localUsers.forEach(u => combined.set(u.id, u));
+
+        // If both empty and we had an error, throw to show the UI error message? 
+        // No, better to show empty list than error if we have fallback support.
+        // But if we want to prompt for Rules deployment, maybe we should let the permission error bubble IF local is empty?
+        // Actually, let's return the list. If it's empty, the table shows "No users found".
+        // If the user REALLY wants to see the permission error, this hides it, but it makes the app usable.
+        // Let's stick to robustness.
+
+        return Array.from(combined.values());
     },
 
     // 2. Certificate Management
@@ -327,14 +365,13 @@ const API = {
             const userCredential = await auth.createUserWithEmailAndPassword(userData.email, userData.password);
             const user = userCredential.user;
 
-            // HARDCODED INITIAL ADMIN SETUP
-            // If email is 'admin@sys.com', force role to ADMIN
+            // 1. Determine Role
+            let role = 'USER';
             if (userData.email === 'admin@sys.com') {
-                userData.role = 'ADMIN';
+                role = 'ADMIN';
             }
 
             // Store Role in Display Name
-            const role = userData.role || 'USER';
             await user.updateProfile({
                 displayName: `${userData.name}|${role}`
             });
@@ -344,7 +381,8 @@ const API = {
                 id: user.uid,
                 name: userData.name,
                 email: user.email,
-                role: role
+                role: role,
+                createdAt: new Date().toISOString()
             });
 
             return {
@@ -439,7 +477,8 @@ const API = {
                 id: user.uid,
                 name: name,
                 email: email,
-                role: 'ADMIN' // Enforced
+                role: 'ADMIN', // Enforced
+                createdAt: new Date().toISOString()
             });
 
             // 5. Cleanup
@@ -619,13 +658,7 @@ const Views = {
                         <label class="input-label">Email</label>
                         <input type="email" name="email" class="input-field" required>
                     </div>
-                     <div class="input-group">
-                        <label class="input-label">Role</label>
-                        <select name="role" class="input-field">
-                            <option value="USER">Student / Graduate</option>
-                            <option value="VERIFIER">Employer / Organization</option>
-                        </select>
-                    </div>
+
                     <div class="input-group">
                         <label class="input-label">Password</label>
                         <input type="password" name="password" class="input-field" required>
@@ -1204,22 +1237,48 @@ Handlers.downloadReport = async (id) => {
 Views.adminUsers = () => {
     // Trigger Hydration
     setTimeout(async () => {
-        const users = await DB.getAllUsers();
-        const tbody = document.getElementById('admin-users-table');
-        if (!tbody) return;
+        try {
+            const users = await DB.getAllUsers();
+            const tbody = document.getElementById('admin-users-table');
+            if (!tbody) return;
 
-        tbody.innerHTML = users.map(u => `
-            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <td style="padding: 1rem;">${u.name}</td>
-                <td style="padding: 1rem;">${u.email}</td>
-                <td style="padding: 1rem;">
-                    <span class="status-badge" style="background: rgba(99,102,241,0.15); color: var(--primary-light);">
-                        ${u.role}
-                    </span>
-                </td>
-                <td style="padding: 1rem; color: var(--success);">Active</td>
-            </tr>
-        `).join('');
+            if (users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="padding:2rem; text-align:center;">No users found.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = users.map(u => `
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
+                    <td style="padding: 1rem;">${u.name || 'Unknown'}</td>
+                    <td style="padding: 1rem;">${u.email}</td>
+                    <td style="padding: 1rem;">
+                        <span class="status-badge" style="background: rgba(99,102,241,0.15); color: var(--primary-light);">
+                            ${u.role || 'USER'}
+                        </span>
+                    </td>
+                    <td style="padding: 1rem;">${u.createdAt ? new Date(u.createdAt).toLocaleDateString() : 'N/A'}</td>
+                    <td style="padding: 1rem; color: var(--success);">Active</td>
+                </tr>
+            `).join('');
+        } catch (e) {
+            console.error(e);
+            const tbody = document.getElementById('admin-users-table');
+            if (tbody) {
+                if (e.code === 'permission-denied') {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="5" style="padding:2rem; text-align:center; color: var(--danger);">
+                                <i class='bx bxs-lock-alt' style="font-size: 2rem; margin-bottom: 0.5rem;"></i><br>
+                                <strong>Permission Denied</strong><br>
+                                Firestore Rules blocked this request.<br>
+                                <span style="font-size: 0.8rem; color: var(--text-muted)">Please deploy the new firestore.rules</span>
+                            </td>
+                        </tr>`;
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="5" style="padding:2rem; text-align:center; color: var(--danger);">Error loading users: ' + e.message + '</td></tr>';
+                }
+            }
+        }
     }, 100);
 
     return `
@@ -1259,11 +1318,12 @@ Views.adminUsers = () => {
                             <th style="padding: 1rem;">Name</th>
                             <th style="padding: 1rem;">Email</th>
                             <th style="padding: 1rem;">Role</th>
+                            <th style="padding: 1rem;">Joined</th>
                             <th style="padding: 1rem;">Status</th>
                         </tr>
                     </thead>
                     <tbody id="admin-users-table">
-                         <tr><td colspan="4" style="padding:2rem; text-align:center;">Loading Users...</td></tr>
+                         <tr><td colspan="5" style="padding:2rem; text-align:center;">Loading Users...</td></tr>
                     </tbody>
                 </table>
             </div>

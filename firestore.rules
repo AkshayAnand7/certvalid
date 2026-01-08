@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is admin
+    // Note: In a real app, you'd use custom claims. 
+    // Here we check if the user's email matches the known admin email.
+    function isAdmin() {
+      return request.auth != null && request.auth.token.email == 'admin@sys.com';
+    }
+
+    // USERS COLLECTION
+    match /users/{userId} {
+      // Users can read/write their own data
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      // Admins can read all user data
+      allow read: if isAdmin();
+    }
+
+    // CERTIFICATES COLLECTION
+    match /certificates/{certId} {
+      // Public read access for verification
+      allow read: if true;
+      // Only authenticated users can create (upload)
+      allow create: if request.auth != null;
+      // Only Admins can update/verify
+      allow update: if isAdmin();
+    }
+  }
+}
