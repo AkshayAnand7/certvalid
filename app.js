@@ -72,6 +72,22 @@ const DB = {
         return Array.from(combined.values());
     },
 
+    deleteUser: async (userId) => {
+        // Delete from Firestore
+        try {
+            await db.collection('users').doc(userId).delete();
+            console.log("Deleted user from Firestore:", userId);
+        } catch (e) {
+            console.warn("Firestore delete failed:", e.message);
+        }
+
+        // Delete from LocalStorage
+        const localUsers = JSON.parse(localStorage.getItem('local_users') || '[]');
+        const filtered = localUsers.filter(u => u.id !== userId);
+        localStorage.setItem('local_users', JSON.stringify(filtered));
+        console.log("Deleted user from LocalStorage:", userId);
+    },
+
     // 2. Certificate Management
     addCertificate: async (cert) => {
         try {
@@ -910,8 +926,8 @@ const Render = {
                                     <td style="padding: 1rem;">${c.data.institution}</td>
                                     <td style="padding: 1rem;">
                                         <div class="flex gap-2">
-                                            <button class="btn btn-secondary" style="padding: 6px; font-size: 0.8rem;" onclick="Handlers.showImage('${c.data.image}')">
-                                                <i class='bx bx-show'></i> View
+                                            <button class="btn btn-secondary" style="padding: 6px; font-size: 0.8rem;" onclick="Handlers.showDocument('${c.data.image}', '${c.data.fileType || 'image'}')">
+                                                <i class='bx bx-show'></i> View ${c.data.fileType === 'pdf' ? 'PDF' : 'Image'}
                                             </button>
                                             <button class="btn btn-success" style="padding: 6px; background: rgba(34,197,94,0.2); color: var(--success); border:none; cursor:pointer;" onclick="Handlers.adminVerify('${c.id}', true)">
                                                 <i class='bx bxs-check-shield'></i> Write to Blockchain
@@ -1108,10 +1124,14 @@ Handlers.handleFileUpload = async (input) => {
 
     // Validate size (Max 500KB for Firestore safety)
     if (file.size > 500 * 1024) {
-        alert("File too large! Please upload an image under 500KB.");
+        alert("File too large! Please upload a file under 500KB.");
         input.value = "";
         return;
     }
+
+    // Detect file type
+    const isPdf = file.type === 'application/pdf';
+    const fileType = isPdf ? 'pdf' : 'image';
 
     // Show Loader
     document.getElementById('upload-step-1').classList.add('hidden');
@@ -1126,11 +1146,11 @@ Handlers.handleFileUpload = async (input) => {
             reader.onerror = error => reject(error);
         });
 
-        // 2. Stimulate OCR
+        // 2. Run OCR (works for images, PDFs may have limited results)
         const data = await API.ocrExtract(base64);
 
-        // 3. Attach Image Data
-        Handlers.currentOcrData = { ...data, image: base64 };
+        // 3. Attach Document Data with file type
+        Handlers.currentOcrData = { ...data, image: base64, fileType: fileType };
 
         // Show Results
         document.getElementById('upload-step-2').classList.add('hidden');
@@ -1257,7 +1277,11 @@ Views.adminUsers = () => {
                         </span>
                     </td>
                     <td style="padding: 1rem;">${u.createdAt ? new Date(u.createdAt).toLocaleDateString() : 'N/A'}</td>
-                    <td style="padding: 1rem; color: var(--success);">Active</td>
+                    <td style="padding: 1rem;">
+                        <button class="btn btn-danger" style="padding: 4px 8px; font-size: 0.75rem; background: rgba(239,68,68,0.2); color: var(--danger); border: none; cursor: pointer;" onclick="Handlers.handleDeleteUser('${u.id}', '${u.email}')">
+                            <i class='bx bx-trash'></i> Delete
+                        </button>
+                    </td>
                 </tr>
             `).join('');
         } catch (e) {
@@ -1319,7 +1343,7 @@ Views.adminUsers = () => {
                             <th style="padding: 1rem;">Email</th>
                             <th style="padding: 1rem;">Role</th>
                             <th style="padding: 1rem;">Joined</th>
-                            <th style="padding: 1rem;">Status</th>
+                            <th style="padding: 1rem;">Actions</th>
                         </tr>
                     </thead>
                     <tbody id="admin-users-table">
@@ -1365,19 +1389,31 @@ Views.adminOverview = () => {
 
 
 
-Views.imageModal = (src) => `
-    <div id="image-modal" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; display:flex; justify-content:center; align-items:center;">
-        <div style="position:relative; max-width:90%; max-height:90%;">
-            <button onclick="document.getElementById('image-modal').remove()" style="position:absolute; top:-2rem; right:0; color:white; background:none; border:none; font-size:2rem; cursor:pointer;">&times;</button>
-            <img src="${src}" style="max-width:100%; max-height:90vh; border-radius: var(--radius-sm); box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+Views.documentModal = (base64, fileType = 'image') => `
+    <div id="document-modal" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); z-index:1000; display:flex; justify-content:center; align-items:center; flex-direction:column;">
+        <div style="position:relative; width:90%; max-width:900px; height:90%; display:flex; flex-direction:column; align-items:center;">
+            <button onclick="document.getElementById('document-modal').remove()" style="position:absolute; top:-2.5rem; right:0; color:white; background:rgba(255,255,255,0.1); border:none; font-size:1.5rem; cursor:pointer; padding:0.5rem 1rem; border-radius:var(--radius-sm); z-index:1001;">&times; Close</button>
+            ${fileType === 'pdf' ? `
+                <embed src="${base64}" type="application/pdf" style="width:100%; height:100%; border-radius: var(--radius-sm); box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+            ` : `
+                <img src="${base64}" style="max-width:100%; max-height:90vh; border-radius: var(--radius-sm); box-shadow: 0 4px 20px rgba(0,0,0,0.5); object-fit:contain;">
+            `}
         </div>
     </div>
 `;
 
-Handlers.showImage = (base64) => {
-    if (!base64) return alert("No image available for this certificate.");
-    const modalHtml = Views.imageModal(base64);
+// Legacy support for showImage calls
+Views.imageModal = (src) => Views.documentModal(src, 'image');
+
+Handlers.showDocument = (base64, fileType = 'image') => {
+    if (!base64) return alert("No document available for this certificate.");
+    const modalHtml = Views.documentModal(base64, fileType);
     document.body.insertAdjacentHTML('beforeend', modalHtml);
+};
+
+// Legacy support
+Handlers.showImage = (base64) => {
+    Handlers.showDocument(base64, 'image');
 };
 
 // ==========================================
@@ -1400,15 +1436,26 @@ Handlers.handleVerificationSearch = async (e) => {
             throw new Error("Certificate not found on Blockchain.");
         }
 
-        // 2. Fetch Details from IPFS (No Firestore)
-        resultDiv.innerHTML = `<div class="loader" style="margin: 0 auto;"></div><p style="text-align:center; margin-top:10px;">Blockchain Verified! Fetching Metadata from IPFS...</p>`;
+        // 2. Fetch Details from IPFS first
+        resultDiv.innerHTML = `<div class="loader" style="margin: 0 auto;"></div><p style="text-align:center; margin-top:10px;">Blockchain Verified! Fetching Metadata...</p>`;
 
         let ipfsData = null;
+        let dbData = null;
+
+        // Try IPFS first
         if (chainData.ipfsHash) {
             ipfsData = await IPFS.fetch(chainData.ipfsHash);
         }
 
-        const isVerified = true;
+        // Fallback to Database if IPFS fails
+        if (!ipfsData) {
+            resultDiv.innerHTML = `<div class="loader" style="margin: 0 auto;"></div><p style="text-align:center; margin-top:10px;">IPFS unavailable, checking database...</p>`;
+            dbData = await DB.getCertificateById(query);
+        }
+
+        // Use IPFS data or fallback to DB data
+        const certDetails = ipfsData || (dbData ? dbData.data : null);
+        const dataSource = ipfsData ? 'IPFS' : (dbData ? 'Database' : null);
 
         resultDiv.innerHTML = `
             <div style="padding: 2rem; background: rgba(34,197,94,0.1); border: 1px solid var(--success); border-radius: var(--radius-md);">
@@ -1426,22 +1473,28 @@ Handlers.handleVerificationSearch = async (e) => {
                         <div><strong>Issued At:</strong> ${chainData.issuedAt}</div>
                         <div><strong>IPFS Hash:</strong> <span style="font-family:monospace; font-size:0.8rem;">${chainData.ipfsHash}</span></div>
                         
-                        ${ipfsData ? `
+                        ${certDetails ? `
                         <div style="grid-column: span 2; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--glass-border);">
-                            <h4 style="margin-bottom:0.5rem;">Student Details (From IPFS)</h4>
-                            <p><strong>Name:</strong> ${ipfsData.name || 'N/A'}</p>
-                            <p><strong>Degree:</strong> ${ipfsData.degree || 'N/A'}</p>
-                            <p><strong>Institution:</strong> ${ipfsData.institution || 'N/A'}</p>
+                            <h4 style="margin-bottom:0.5rem;">Student Details (From ${dataSource})</h4>
+                            <p><strong>Name:</strong> ${certDetails.name || 'N/A'}</p>
+                            <p><strong>Degree:</strong> ${certDetails.degree || 'N/A'}</p>
+                            <p><strong>Institution:</strong> ${certDetails.institution || 'N/A'}</p>
                             
-                            <!-- Display Image if Available -->
-                            ${ipfsData.image ? `
+                            <!-- Display Document if Available -->
+                            ${certDetails.image ? `
                                 <div style="margin-top: 1rem; text-align: center;">
                                     <p style="margin-bottom: 0.5rem; color: var(--text-muted);">Certificate Copy:</p>
-                                    <img src="${ipfsData.image}" style="max-width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--glass-border); cursor: pointer;" onclick="Handlers.showImage('${ipfsData.image}')">
+                                    ${certDetails.fileType === 'pdf' ? `
+                                        <button class="btn btn-primary" style="padding: 10px 20px;" onclick="Handlers.showDocument('${certDetails.image}', 'pdf')">
+                                            <i class='bx bxs-file-pdf'></i> View PDF Certificate
+                                        </button>
+                                    ` : `
+                                        <img src="${certDetails.image}" style="max-width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--glass-border); cursor: pointer;" onclick="Handlers.showDocument('${certDetails.image}', 'image')">
+                                    `}
                                 </div>
                             ` : ''}
                         </div>
-                        ` : '<div style="grid-column: span 2; margin-top:1rem; color:var(--warning);"><i>Details could not be loaded from IPFS (Hash might be invalid or timed out).</i></div>'}
+                        ` : '<div style="grid-column: span 2; margin-top:1rem; color:var(--warning);"><i>Details could not be loaded from IPFS or Database.</i></div>'}
                 </div>
             </div>
         `;
@@ -1520,6 +1573,20 @@ Handlers.handleCreateAdmin = async (e) => {
 
     } catch (err) {
         alert("Failed to create Admin: " + err.message);
+    }
+};
+
+Handlers.handleDeleteUser = async (userId, email) => {
+    if (!confirm(`Are you sure you want to delete user "${email}"?\n\nNote: This only removes them from the database. If they still exist in Firebase Auth, they can re-register.`)) {
+        return;
+    }
+
+    try {
+        await DB.deleteUser(userId);
+        alert(`User "${email}" deleted successfully!`);
+        State.navigate('admin-users'); // Refresh the list
+    } catch (err) {
+        alert("Failed to delete user: " + err.message);
     }
 };
 
