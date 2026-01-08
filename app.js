@@ -943,7 +943,33 @@ const Render = {
         const container = document.getElementById('admin-overview-container');
         if (!container) return;
 
+        container.innerHTML = `<div class="loader" style="margin: 2rem auto;"></div><p style="text-align:center;">Loading and syncing with blockchain...</p>`;
+
         const certs = await DB.getAllCertificates();
+
+        // Check blockchain for pending certificates and sync status
+        let syncCount = 0;
+        for (const cert of certs) {
+            if (cert.status === 'PENDING') {
+                try {
+                    console.log(`[SYNC] Checking blockchain for ${cert.id}...`);
+                    const chainData = await Blockchain.verifyCertificate(cert.id);
+                    if (chainData && chainData.exists) {
+                        console.log(`[SYNC] ${cert.id} found on blockchain! Updating status...`);
+                        await DB.updateCertificateStatus(cert.id, 'VERIFIED', null, chainData.issuerAddress);
+                        cert.status = 'VERIFIED'; // Update local reference
+                        syncCount++;
+                    }
+                } catch (e) {
+                    console.warn(`[SYNC] Could not check ${cert.id}:`, e.message);
+                }
+            }
+        }
+
+        if (syncCount > 0) {
+            console.log(`[SYNC] Synced ${syncCount} certificate(s) from blockchain`);
+        }
+
         const pending = certs.filter(c => c.status === 'PENDING');
         const verified = certs.filter(c => c.status === 'VERIFIED');
 
@@ -963,8 +989,20 @@ const Render = {
                  </div>
             </div>
 
+            ${syncCount > 0 ? `
+                <div style="background: rgba(34,197,94,0.1); border: 1px solid var(--success); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1.5rem;">
+                    <i class='bx bx-check-circle' style="color: var(--success);"></i> 
+                    Synced ${syncCount} certificate(s) from blockchain!
+                </div>
+            ` : ''}
+
             <div class="glass-card">
-                <h3>Pending Approvals (Institution Simulation)</h3>
+                <div class="flex justify-between items-center mb-4">
+                    <h3>Pending Approvals (Institution Simulation)</h3>
+                    <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.8rem;" onclick="Render.hydrateAdminOverview()">
+                        <i class='bx bx-refresh'></i> Sync with Blockchain
+                    </button>
+                </div>
                 <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
                     *In a real system, these would be handled via Email Links by the University. As Admin/Demo, you can override here.
                 </p>
