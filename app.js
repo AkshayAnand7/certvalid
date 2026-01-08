@@ -1,19 +1,4 @@
-/**
- * AntiGravity - Blockchain Certificate Validation System
- * Core Application Logic (SPA)
- */
 
-// ==========================================
-// MOCK API SERVICES
-// ==========================================
-
-// ==========================================
-// CONFIGURATION & BLOCKCHAIN SERVICES
-// ==========================================
-
-// ==========================================
-// FIREBASE CONFIGURATION
-// ==========================================
 
 
 const firebaseConfig = {
@@ -31,9 +16,6 @@ firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
 
-// ==========================================
-// FIRESTORE DATABASE SERVICE
-// ==========================================
 
 const DB = {
     // 1. User Management
@@ -387,6 +369,58 @@ const API = {
         }
     },
 
+    // Google Sign-In
+    googleSignIn: async (selectedRole = 'USER') => {
+        try {
+            const provider = new firebase.auth.GoogleAuthProvider();
+            provider.addScope('email');
+            provider.addScope('profile');
+
+            const result = await auth.signInWithPopup(provider);
+            const user = result.user;
+
+            // Check if user exists in Firestore
+            const existingUser = await DB.getUser(user.uid);
+
+            if (existingUser) {
+                // User exists, return their data
+                return {
+                    id: user.uid,
+                    name: existingUser.name,
+                    email: user.email,
+                    role: existingUser.role
+                };
+            } else {
+                // New user - create profile with selected role
+                const name = user.displayName || user.email.split('@')[0];
+                const role = selectedRole;
+
+                // Update Firebase displayName with role
+                await user.updateProfile({
+                    displayName: `${name}|${role}`
+                });
+
+                // Save to Firestore
+                await DB.saveUser({
+                    id: user.uid,
+                    name: name,
+                    email: user.email,
+                    role: role
+                });
+
+                return {
+                    id: user.uid,
+                    name: name,
+                    email: user.email,
+                    role: role
+                };
+            }
+        } catch (error) {
+            console.error("Google Sign-In Error:", error);
+            throw error;
+        }
+    },
+
     // Create New Admin (Without Logging Out Current User)
     createAdminUser: async (name, email, password) => {
         // 1. Initialize Secondary App
@@ -510,9 +544,8 @@ const State = {
     }
 };
 
-// ==========================================
-// COMPONENT RENDERERS
-// ==========================================
+
+
 
 const Views = {
     login: () => `
@@ -539,6 +572,24 @@ const Views = {
                     
                     <button type="submit" class="btn btn-primary w-full justify-center">
                         Secure Login <i class='bx bx-log-in-circle'></i>
+                    </button>
+                    
+                    <!-- Divider -->
+                    <div class="mt-4" style="display: flex; align-items: center; gap: 1rem;">
+                        <div style="flex: 1; height: 1px; background: var(--glass-border);"></div>
+                        <span style="color: var(--text-muted); font-size: 0.85rem;">OR</span>
+                        <div style="flex: 1; height: 1px; background: var(--glass-border);"></div>
+                    </div>
+                    
+                    <!-- Google Sign-In -->
+                    <button type="button" onclick="Handlers.handleGoogleSignIn()" class="btn btn-google w-full justify-center mt-4">
+                        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z" fill="#4285F4"/>
+                            <path d="M9.003 18c2.43 0 4.467-.806 5.956-2.18l-2.909-2.26c-.806.54-1.836.86-3.047.86-2.344 0-4.328-1.584-5.036-3.711H.96v2.332C2.44 15.983 5.485 18 9.003 18z" fill="#34A853"/>
+                            <path d="M3.964 10.712c-.18-.54-.282-1.117-.282-1.71 0-.593.102-1.17.282-1.71V4.96H.957C.347 6.175 0 7.55 0 9.002c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
+                            <path d="M9.003 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.464.891 11.428 0 9.002 0 5.485 0 2.44 2.017.96 4.958l3.004 2.332c.708-2.127 2.692-3.71 5.036-3.71z" fill="#EA4335"/>
+                        </svg>
+                        Continue with Google
                     </button>
                     
                     <div class="mt-4" style="text-align: center; font-size: 0.9rem;">
@@ -582,6 +633,24 @@ const Views = {
                     
                     <button type="submit" class="btn btn-primary w-full justify-center">
                         Register
+                    </button>
+                    
+                    <!-- Divider -->
+                    <div class="mt-4" style="display: flex; align-items: center; gap: 1rem;">
+                        <div style="flex: 1; height: 1px; background: var(--glass-border);"></div>
+                        <span style="color: var(--text-muted); font-size: 0.85rem;">OR</span>
+                        <div style="flex: 1; height: 1px; background: var(--glass-border);"></div>
+                    </div>
+                    
+                    <!-- Google Sign-Up -->
+                    <button type="button" onclick="Handlers.handleGoogleSignUp()" class="btn btn-google w-full justify-center mt-4">
+                        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z" fill="#4285F4"/>
+                            <path d="M9.003 18c2.43 0 4.467-.806 5.956-2.18l-2.909-2.26c-.806.54-1.836.86-3.047.86-2.344 0-4.328-1.584-5.036-3.711H.96v2.332C2.44 15.983 5.485 18 9.003 18z" fill="#34A853"/>
+                            <path d="M3.964 10.712c-.18-.54-.282-1.117-.282-1.71 0-.593.102-1.17.282-1.71V4.96H.957C.347 6.175 0 7.55 0 9.002c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
+                            <path d="M9.003 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.464.891 11.428 0 9.002 0 5.485 0 2.44 2.017.96 4.958l3.004 2.332c.708-2.127 2.692-3.71 5.036-3.71z" fill="#EA4335"/>
+                        </svg>
+                        Sign up with Google
                     </button>
                     
                     <div class="mt-4" style="text-align: center;">
@@ -713,6 +782,43 @@ const Handlers = {
             alert(`Password Reset Email sent to ${email}`);
         } catch (err) {
             alert("Error: " + err.message);
+        }
+    },
+
+    // Google Sign-In Handler (Login Page)
+    handleGoogleSignIn: async () => {
+        try {
+            const user = await API.googleSignIn('USER');
+            if (user) {
+                State.loginUser(user);
+            }
+        } catch (err) {
+            if (err.code === 'auth/popup-closed-by-user') {
+                console.log('Sign-in popup closed');
+            } else {
+                alert("Google Sign-In Failed: " + (err.message || err));
+            }
+        }
+    },
+
+    // Google Sign-Up Handler (Register Page - respects role selection)
+    handleGoogleSignUp: async () => {
+        try {
+            // Get selected role from the form
+            const roleSelect = document.querySelector('select[name="role"]');
+            const selectedRole = roleSelect ? roleSelect.value : 'USER';
+
+            const user = await API.googleSignIn(selectedRole);
+            if (user) {
+                alert(`Welcome ${user.name}! You are registered as ${user.role}.`);
+                State.loginUser(user);
+            }
+        } catch (err) {
+            if (err.code === 'auth/popup-closed-by-user') {
+                console.log('Sign-up popup closed');
+            } else {
+                alert("Google Sign-Up Failed: " + (err.message || err));
+            }
         }
     }
 };

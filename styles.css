@@ -152,6 +152,22 @@ h6 {
     border: 1px solid rgba(239, 68, 68, 0.2);
 }
 
+.btn-google {
+    background: white;
+    color: #333;
+    border: 1px solid rgba(0, 0, 0, 0.1);
+    font-weight: 500;
+}
+
+.btn-google:hover {
+    background: #f8f8f8;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.btn-google svg {
+    flex-shrink: 0;
+}
+
 .glass-card {
     background: var(--glass-bg);
     backdrop-filter: blur(12px);
