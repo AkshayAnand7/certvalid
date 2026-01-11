@@ -401,6 +401,11 @@ const API = {
     // Register with Firebase
     register: async (userData) => {
         try {
+            // Validate register number
+            if (!userData.registerNumber || userData.registerNumber.trim() === '') {
+                throw new Error('Register number is required');
+            }
+
             const userCredential = await auth.createUserWithEmailAndPassword(userData.email, userData.password);
             const user = userCredential.user;
 
@@ -415,11 +420,12 @@ const API = {
                 displayName: `${userData.name}|${role}`
             });
 
-            // SAVE USER TO FIRESTORE
+            // SAVE USER TO FIRESTORE (with register number)
             await DB.saveUser({
                 id: user.uid,
                 name: userData.name,
                 email: user.email,
+                registerNumber: userData.registerNumber.trim().toUpperCase(),
                 role: role,
                 createdAt: new Date().toISOString()
             });
@@ -428,6 +434,7 @@ const API = {
                 id: user.uid,
                 name: userData.name,
                 email: user.email,
+                registerNumber: userData.registerNumber.trim().toUpperCase(),
                 role: role
             };
         } catch (error) {
@@ -543,7 +550,7 @@ const API = {
             console.log("[OCR] Trying PaddleOCR backend...");
 
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+            const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout for large PDFs
 
             const response = await fetch(PADDLE_OCR_URL, {
                 method: 'POST',
@@ -558,6 +565,12 @@ const API = {
                 const result = await response.json();
                 console.log("[OCR] PaddleOCR Success:", result);
 
+                // Check if there's an error in the response
+                if (result.error) {
+                    console.warn("[OCR] Backend returned error:", result.error);
+                    throw new Error(result.error);
+                }
+
                 if (!result.name && !result.degree) {
                     alert("OCR finished but some fields are missing. Please manually enter/correct the details.");
                 }
@@ -570,6 +583,10 @@ const API = {
                     year: result.year || new Date().getFullYear().toString(),
                     gpa: result.gpa || ""
                 };
+            } else {
+                const errorText = await response.text();
+                console.warn("[OCR] Backend error response:", response.status, errorText);
+                throw new Error(`Server error: ${response.status}`);
             }
         } catch (err) {
             console.warn("[OCR] PaddleOCR backend unavailable, falling back to Tesseract.js:", err.message);
@@ -736,7 +753,12 @@ const Views = {
                         <label class="input-label">Email</label>
                         <input type="email" name="email" class="input-field" required>
                     </div>
-
+                    <div class="input-group">
+                        <label class="input-label">Register Number <span style="color: var(--danger);">*</span></label>
+                        <input type="text" name="registerNumber" class="input-field" placeholder="e.g., CS20253072" required 
+                               pattern="[A-Za-z0-9]+" title="Register number should contain only letters and numbers">
+                        <small style="color: var(--text-muted); font-size: 0.75rem;">Your unique student/enrollment ID from your institution</small>
+                    </div>
                     <div class="input-group">
                         <label class="input-label">Password</label>
                         <input type="password" name="password" class="input-field" required>
@@ -1143,10 +1165,14 @@ Views.userUpload = () => `
                     </div>
                     <div>
                         <label class="input-label">Institution</label>
-                        <input type="text" id="ocr-inst" class="input-field">
+                        <input type="text" id="ocr-inst" class="input-field" placeholder="e.g., Dr N.G.P Institute of Technology">
                     </div>
                     <div>
-                        <label class="input-label">Degree</label>
+                        <label class="input-label">Organized By</label>
+                        <input type="text" id="ocr-organizer" class="input-field" placeholder="e.g., Centre for Internet of Things">
+                    </div>
+                    <div>
+                        <label class="input-label">Degree/Program</label>
                         <input type="text" id="ocr-degree" class="input-field">
                     </div>
                 </div>
@@ -1249,18 +1275,40 @@ Handlers.handleFileUpload = async (input) => {
         // 2. Run OCR (works for images, PDFs may have limited results)
         const data = await API.ocrExtract(base64);
 
-        // 3. Attach Document Data with file type
+        // 3. Get user's registered register number
+        const userRegNumber = State.user?.registerNumber || '';
+
+        // 4. Check if OCR register number matches user's registered one
+        let registerNumberMismatch = false;
+        if (userRegNumber && data.registerNumber) {
+            const ocrReg = data.registerNumber.toUpperCase().replace(/\s/g, '');
+            const userReg = userRegNumber.toUpperCase().replace(/\s/g, '');
+            if (ocrReg !== userReg && ocrReg.length > 3) {
+                registerNumberMismatch = true;
+                alert(`⚠️ Warning: The register number in the certificate (${ocrReg}) does not match your registered number (${userReg}).\n\nPlease verify you are uploading the correct certificate.`);
+            }
+        }
+
+        // 5. Attach Document Data with file type
         Handlers.currentOcrData = { ...data, image: base64, fileType: fileType };
 
         // Show Results
         document.getElementById('upload-step-2').classList.add('hidden');
         document.getElementById('upload-step-3').classList.remove('hidden');
 
-        // Fill Form
+        // Fill Form - Use user's registered register number (not OCR result)
         document.getElementById('ocr-name').value = data.name;
-        document.getElementById('ocr-reg').value = data.registerNumber;
-        document.getElementById('ocr-inst').value = data.institution;
+        document.getElementById('ocr-reg').value = userRegNumber || data.registerNumber; // Prefer user's registered number
+        document.getElementById('ocr-inst').value = data.institution || '';
+        document.getElementById('ocr-organizer').value = data.organizer || '';
         document.getElementById('ocr-degree').value = data.degree;
+
+        // Show mismatch warning if applicable
+        if (registerNumberMismatch) {
+            const regField = document.getElementById('ocr-reg');
+            regField.style.borderColor = 'var(--warning)';
+            regField.style.background = 'rgba(251, 191, 36, 0.1)';
+        }
     } catch (err) {
         alert(err);
         Handlers.resetUpload();
@@ -1280,6 +1328,7 @@ Handlers.submitCertificate = async (event) => {
     const name = document.getElementById('ocr-name').value;
     const reg = document.getElementById('ocr-reg').value;
     const inst = document.getElementById('ocr-inst').value;
+    const organizer = document.getElementById('ocr-organizer').value;
     const degree = document.getElementById('ocr-degree').value;
 
     // Update the data object to be uploaded
@@ -1288,6 +1337,7 @@ Handlers.submitCertificate = async (event) => {
         name: name,
         registerNumber: reg,
         institution: inst,
+        organizer: organizer,
         degree: degree
     };
 
@@ -1692,17 +1742,30 @@ Handlers.handleDeleteUser = async (userId, email) => {
 
 // Start
 // Auth Persistence
-auth.onAuthStateChanged(firebaseUser => {
+auth.onAuthStateChanged(async firebaseUser => {
     if (firebaseUser) {
         // Parse Role from Display Name
         const [name, role] = (firebaseUser.displayName || "User|USER").split('|');
+
+        // Fetch full user data from Firestore (includes register number)
+        let registerNumber = '';
+        try {
+            const userData = await DB.getUser(firebaseUser.uid);
+            if (userData && userData.registerNumber) {
+                registerNumber = userData.registerNumber;
+            }
+        } catch (e) {
+            console.warn("Could not fetch user data from Firestore:", e);
+        }
+
         const user = {
             id: firebaseUser.uid,
             name: name,
             email: firebaseUser.email,
+            registerNumber: registerNumber,
             role: role
         };
-        console.log("Auth State: Logged In", user.email);
+        console.log("Auth State: Logged In", user.email, "Register:", registerNumber);
         State.loginUser(user);
     } else {
         console.log("Auth State: Signed Out");
