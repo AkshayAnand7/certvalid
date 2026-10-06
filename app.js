@@ -638,7 +638,7 @@ const API = {
             );
 
             console.log("OCR Raw Text:", text);
-            const fullText = text.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ');
+            const fullText = text.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
             const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 2);
 
             // Smart extraction patterns
@@ -651,103 +651,108 @@ const API = {
             // Helper: Clean extracted text
             const cleanText = (str) => {
                 if (!str) return "";
-                // Remove common garbage phrases
                 return str
-                    .replace(/\s*(This is to certify|This certificate is|certificate is presented|is presented to|presented to)\s*/gi, '')
-                    .replace(/\s*(of|from|has|for)\s*$/i, '')
-                    .replace(/^\s*(Mr\.|Ms\.|Mrs\.|Miss\.?)\s*/i, '')
+                    .replace(/\s*(This is to certify|This certificate is|certificate is presented|is presented to|presented to)(\s+that)?\s*/gi, '')
+                    .replace(/\s*(of|from|has|for|the|in|a|an)\s*$/i, '')
+                    .replace(/^\s*(Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)\s*/i, '')
+                    .replace(/[,.]$/, '')
                     .replace(/\s+/g, ' ')
                     .trim();
+            };
+
+            // Helper: Validate extracted name (filter false positives)
+            const isValidName = (n) => {
+                if (!n || n.length < 3 || n.length > 50) return false;
+                const invalidWords = /\b(CERTIFICATE|COLLEGE|UNIVERSITY|INSTITUTE|TECHNOLOGY|DEPARTMENT|WORKSHOP|TRAINING|BOOTCAMP|PARTICIPATION|APPRECIATION|COMPLETION|ACHIEVEMENT|EXCELLENCE|CONDUCTED|ORGANIZED|ORGANISED|ASSOCIATION|AFFILIATED|AUTONOMOUS|EDUCATION|ACCREDITED|REGISTERED|PROGRAMME|NATIONAL|INTERNATIONAL)\b/i;
+                if (invalidWords.test(n)) return false;
+                // Must contain at least one word with 2+ alpha chars
+                const words = n.split(/\s+/).filter(w => w.replace(/[^a-zA-Z]/g, '').length >= 2);
+                return words.length >= 1;
             };
 
             // =============================================
             // IMPROVED NAME EXTRACTION PATTERNS
             // =============================================
 
-            // Pattern 1: ALL CAPS names (common in certificates) - more flexible
-            const capsNameMatch = fullText.match(/(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|to|that)\s+([A-Z][A-Z\s\.]{2,40}?)(?:\s+of\s+|\s+from\s+|\s+for\s+|\s+has\s+|\s+bearing\s+|\s+with\s+|\s+a\s+student|\s*,)/);
-            if (capsNameMatch) {
-                name = cleanText(capsNameMatch[1]);
-            }
+            const namePatterns = [
+                // Pattern 1: "certify that Mr./Ms./Mrs. NAME" (most reliable for Indian certs)
+                /certif(?:y|ies|ied)\s+that\s+(?:Mr\.?\s*\/?\s*Ms\.?|Ms\.?\s*\/?\s*Mr\.?|Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)\s*\.?\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){0,4})/i,
+                // Pattern 2: "certify that NAME" (without title)
+                /certif(?:y|ies|ied)\s+that\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,4})(?:\s+(?:of|from|has|bearing|with|a\s+student|is|studying))/i,
+                // Pattern 3: "presented to / awarded to / given to NAME"
+                /(?:presented|awarded|given|granted|issued)\s+to\s+(?:Mr\.?\s*\/?\s*Ms\.?|Mr\.?|Ms\.?|Mrs\.?|Miss\.?)?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){0,4})(?:\s+(?:of|from|for|bearing|a\s+student|,|\.|studying))/i,
+                // Pattern 4: "presented to / awarded to NAME" (relaxed ending)
+                /(?:presented|awarded|given|granted|issued)\s+to\s+(?:Mr\.?\s*\/?\s*Ms\.?|Mr\.?|Ms\.?|Mrs\.?|Miss\.?)?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){1,4})/i,
+                // Pattern 5: "Name:" or "Student Name:" label format
+                /(?:Student\s+)?Name\s*[:;]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){0,4})/i,
+                // Pattern 6: ALL CAPS name after title prefix (CHANDRUT, AKSHAY ANAND, etc.)
+                /(?:Mr\.?\s*\/?\s*Ms\.?|Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)\s+([A-Z][A-Z\s\.]{2,40}?)(?:\s+of\s+|\s+from\s+|\s+for\s+|\s+has\s+|\s+bearing\s+|\s+with\s+|\s+a\s+student|\s*,|\s+studying)/i,
+                // Pattern 7: Name near register number
+                /([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){1,3})\s+(?:bearing|with|having)\s+(?:Reg|Register|Roll|ID|Enrol)/i,
+                // Pattern 8: "student NAME of" or "student NAME from"
+                /student\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){1,3})\s+(?:of|from)/i,
+                // Pattern 9: "to certify that NAME has"
+                /to\s+certif(?:y|ies|ied)\s+that\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){1,4})\s+has/i,
+                // Pattern 10: Generic "Mr./Ms. NAME" anywhere
+                /(?:Mr\.?\s*\/?\s*Ms\.?|Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){0,3})/i,
+            ];
 
-            // Pattern 2: "certify that [Title] NAME" - more flexible ending
-            if (!name) {
-                const certifyMatch = fullText.match(/certif(?:y|ies|ied)\s+that\s+(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)?\s*([A-Z][A-Za-z\s\.]+?)(?:\s+of\s+|\s+from\s+|\s+has\s+|\s+for\s+|\s+bearing\s+|\s+with\s+|\s+a\s+student|\s*,)/i);
-                if (certifyMatch) {
-                    name = cleanText(certifyMatch[1]);
+            for (const pattern of namePatterns) {
+                const match = fullText.match(pattern);
+                if (match && match[1]) {
+                    const candidate = cleanText(match[1]);
+                    if (isValidName(candidate)) {
+                        name = candidate;
+                        console.log(`[OCR] Name matched by pattern: ${pattern.source.substring(0, 40)}...`);
+                        break;
+                    }
                 }
             }
 
-            // Pattern 2b: Handle "Mr./Ms." combined format (common in Indian certificates)
-            // Also handles single-letter initials like "Kiruthiga N" or "AKSHAY ANAND M P"
-            if (!name) {
-                const mrMsMatch = fullText.match(/(?:Mr\.?\s*\/\s*Ms\.?|Ms\.?\s*\/\s*Mr\.?)\s+([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)*?)(?:\s+of\s+|\s+from\s+|\s+has\s+|\s+for\s+|\s+bearing\s+|\s*,)/i);
-                if (mrMsMatch) {
-                    name = cleanText(mrMsMatch[1]);
-                }
-            }
-
-            // Pattern 3: "presented to" or "awarded to" - more flexible
-            if (!name) {
-                const presentedMatch = fullText.match(/(?:presented\s+to|awarded\s+to|granted\s+to|given\s+to)\s+(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?)?\s*([A-Z][A-Za-z\s\.]+?)(?:\s+of\s+|\s+from\s+|\s+for\s+|\s+bearing\s+|\s+a\s+student|\s*,)/i);
-                if (presentedMatch) {
-                    name = cleanText(presentedMatch[1]);
-                }
-            }
-
-            // Pattern 4: Look for "Mr./Ms./Mrs. NAME" anywhere in text
-            if (!name) {
-                const titleMatch = fullText.match(/(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})(?:\s+of\s+|\s+from\s+|\s+has\s+|\s+bearing\s+|\s+a\s+student|\s*,)/i);
-                if (titleMatch) {
-                    name = cleanText(titleMatch[1]);
-                }
-            }
-
-            // Pattern 5: Look for name near register number (common format: "NAME bearing Reg No: XXX")
-            if (!name) {
-                const bearingMatch = fullText.match(/([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})\s+(?:bearing|with|having)\s+(?:Reg|Register|Roll|ID)/i);
-                if (bearingMatch) {
-                    name = cleanText(bearingMatch[1]);
-                }
-            }
-
-            // Pattern 6: Line-by-line search for names (look for capitalized words after certify lines)
+            // Pattern 11: Line-by-line search for standalone name lines
             if (!name) {
                 for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i];
-                    // Skip institutional/organizational lines
-                    if (/college|university|institute|technology|department|centre|center|conducted|organized|association/i.test(line)) continue;
-                    // Skip certificate type lines
-                    if (/certificate|participation|appreciation|completion|achievement/i.test(line)) continue;
+                    const line = lines[i].trim();
+                    // Skip lines with institutional/organizational keywords
+                    if (/college|university|institute|technology|department|centre|center|conducted|organized|association|certificate|participation|appreciation|completion|achievement|workshop|training|bootcamp/i.test(line)) continue;
                     // Skip date/year lines
-                    if (/\b(20\d{2}|january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(line)) continue;
-                    // Skip register number lines
+                    if (/\b(20\d{2}|january|february|march|april|may|june|july|august|september|october|november|december|date|day)\b/i.test(line)) continue;
+                    // Skip lines with many numbers (register numbers, codes)
                     if (/\b\d{5,}\b/.test(line)) continue;
+                    // Skip very short or very long lines
+                    if (line.length < 4 || line.length > 40) continue;
 
-                    // Look for proper name pattern (2-4 capitalized words)
+                    // Check for proper name: 2-4 Capitalized words
                     const nameMatch = line.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})$/);
-                    if (nameMatch) {
+                    if (nameMatch && isValidName(nameMatch[1])) {
                         name = nameMatch[1].trim();
+                        console.log(`[OCR] Name found on standalone line: "${name}"`);
                         break;
                     }
 
-                    // Also check for ALL CAPS name on its own line
-                    const capsMatch = line.match(/^([A-Z][A-Z\s\.]{5,35})$/);
-                    if (capsMatch && !/CERTIFICATE|COLLEGE|UNIVERSITY|INSTITUTE|TECHNOLOGY|DEPARTMENT/i.test(capsMatch[1])) {
+                    // Check for ALL CAPS name on its own line (e.g. "CHANDRUT" or "AKSHAY ANAND")
+                    const capsMatch = line.match(/^([A-Z][A-Z\s]{2,35})$/);
+                    if (capsMatch && isValidName(capsMatch[1].trim())) {
                         name = capsMatch[1].trim();
+                        console.log(`[OCR] ALL CAPS name found on line: "${name}"`);
                         break;
                     }
                 }
             }
 
-            // Pattern 7: Look for any proper noun sequence (2-4 capitalized words together)
+            // Pattern 12: Proper noun near "has participated" or "has completed" or "has successfully"
             if (!name) {
-                const properNounMatch = fullText.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(?:of|from|has|a\s+student)/);
-                if (properNounMatch) {
-                    // Make sure it's not an institution name
-                    if (!/college|university|institute|technology/i.test(properNounMatch[1])) {
-                        name = properNounMatch[1].trim();
-                    }
+                const partMatch = fullText.match(/([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]*){0,3})\s+has\s+(?:participated|completed|successfully|attended|undergone)/i);
+                if (partMatch && isValidName(cleanText(partMatch[1]))) {
+                    name = cleanText(partMatch[1]);
+                }
+            }
+
+            // Pattern 13: Look for any proper noun sequence (2-4 capitalized words) before "of" or "from"
+            if (!name) {
+                const properNounMatch = fullText.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(?:of|from)\s+/);
+                if (properNounMatch && isValidName(properNounMatch[1])) {
+                    name = properNounMatch[1].trim();
                 }
             }
 
@@ -755,27 +760,44 @@ const API = {
             // INSTITUTION EXTRACTION
             // =============================================
             const instPatterns = [
-                // Pattern: "of Dr.N.G.P Institute of Technology" or "of Dr N.G.P Institute of Technology"
-                /(?:of|from)\s+((?:Dr\.?\s*)?[A-Z]\.?[A-Z]\.?[A-Z]\.?[A-Z]?\.?\s*(?:Institute|College|University|Polytechnic)(?:\s+of\s+[A-Za-z\s]+)?)/i,
-                // Pattern: "Dr.N.G.P. Institute of Technology"
-                /\b((?:Dr\.?\s*)?(?:[A-Z]\.?\s*){2,4}(?:Institute|College|University)(?:\s+of\s+[A-Za-z]+)?)/i,
-                // Pattern: standard institution names
-                /(?:of|from)\s+((?:Dr\.?\s*)?[A-Z][A-Za-z\.\s]+?(?:Institute|College|University|Polytechnic)(?:\s+of\s+[A-Za-z\s]+)?)/i,
-                // Pattern: "student of INSTITUTION"
-                /student\s+of\s+([A-Z][A-Za-z\.\s]+?(?:Institute|College|University|Technology))/i
+                // Pattern 1: "of/from Dr.N.G.P Institute of Technology" style
+                /(?:of|from)\s+((?:Dr\.?\s*)?(?:[A-Z]\.?\s*){1,5}(?:Institute|College|University|Polytechnic)(?:\s+of\s+[A-Za-z\s]+)?)/i,
+                // Pattern 2: "of/from FULL NAME College/University"
+                /(?:of|from)\s+((?:Dr\.?\s*)?[A-Z][A-Za-z\.\s]+?(?:Institute|College|University|Polytechnic|School)(?:\s+of\s+[A-Za-z\s]+)?)/i,
+                // Pattern 3: "student of INSTITUTION"
+                /student\s+of\s+((?:Dr\.?\s*)?[A-Z][A-Za-z\.\s]+?(?:Institute|College|University|Technology|Polytechnic))/i,
+                // Pattern 4: "affiliated to INSTITUTION"
+                /affiliated\s+(?:to|with)\s+([A-Z][A-Za-z\.\s]+?(?:University|Institute))/i,
+                // Pattern 5: ALL CAPS institution in header (PSG COLLEGE OF TECHNOLOGY)
+                /\b([A-Z]{2,}(?:\s+[A-Z]+)*\s+(?:COLLEGE|INSTITUTE|UNIVERSITY)\s+OF\s+[A-Z]+(?:\s+[A-Z]+)?)\b/,
+                // Pattern 6: Line-by-line header scan for institution names
             ];
+
             for (const pattern of instPatterns) {
                 const match = fullText.match(pattern);
                 if (match && match[1]) {
-                    // Skip if it contains certificate type words
-                    if (/appreciation|participation|completion|achievement/i.test(match[1])) continue;
-                    inst = match[1].trim();
-                    // Clean up trailing words
-                    inst = inst.replace(/\s+(has|for|on|in|the|,)\s*$/i, '').trim();
-                    // Remove trailing comma or period
-                    inst = inst.replace(/[,.]$/, '').trim();
-                    if (inst.length > 60) inst = inst.substring(0, 60);
-                    if (inst.length > 5) break; // Only accept if reasonable length
+                    const candidate = match[1].trim()
+                        .replace(/\s+(has|for|on|in|the|,|and|is|was)\s*$/i, '')
+                        .replace(/[,.]$/, '')
+                        .trim();
+                    if (candidate.length > 5 && candidate.length <= 80 &&
+                        !/appreciation|participation|completion|achievement/i.test(candidate)) {
+                        inst = candidate;
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: scan lines for institution keywords
+            if (!inst) {
+                for (const line of lines) {
+                    if (/(?:college|institute|university|polytechnic)\s+(?:of|for)/i.test(line)) {
+                        const cleaned = line.trim().replace(/[,.]$/, '');
+                        if (cleaned.length > 5 && cleaned.length <= 80) {
+                            inst = cleaned;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -785,8 +807,7 @@ const API = {
             // Pattern 1: "conducted at/by" with full institution name
             const conductedMatch = fullText.match(/conducted\s+(?:at|by)\s+((?:Dr\.?\s*)?(?:[A-Z]\.?\s*)*[A-Z][A-Za-z\.\s]+?(?:College|University|Institute|Technology)(?:\s+of\s+[A-Za-z]+)?)/i);
             if (conductedMatch) {
-                organizer = conductedMatch[1].trim();
-                organizer = organizer.replace(/\s+(on|from|in|the|during)\s*$/i, '').trim();
+                organizer = conductedMatch[1].trim().replace(/\s+(on|from|in|the|during)\s*$/i, '').trim();
             }
 
             // Pattern 2: "organized by" or "organised by"
@@ -797,15 +818,15 @@ const API = {
                 }
             }
 
-            // Pattern 3: "Centre for IoT" or similar with full context
+            // Pattern 3: "Centre for IoT" or similar
             if (!organizer) {
-                const centreMatch = fullText.match(/((?:Centre|Center)\s+for\s+(?:Internet\s+of\s+Things|IoT|[A-Za-z\s&]+?))\s*(?:,|\(|in\s+association)/i);
+                const centreMatch = fullText.match(/((?:Centre|Center)\s+for\s+(?:Internet\s+of\s+Things|IoT|[A-Za-z\s&]+?))(?:\s*(?:,|\(|in\s+association))/i);
                 if (centreMatch) {
                     organizer = centreMatch[1].trim();
                 }
             }
 
-            // Pattern 4: Look for full organization with campus info
+            // Pattern 4: Campus-based info
             if (!organizer) {
                 const campusMatch = fullText.match(/((?:C-IoT|Centre\s+for\s+[^,]+),?\s*(?:MIT\s+Campus|[A-Z]+\s+Campus)[^,]*)/i);
                 if (campusMatch) {
@@ -813,12 +834,20 @@ const API = {
                 }
             }
 
-            // Pattern 5: Extract institution name from header (PSG COLLEGE OF TECHNOLOGY, etc.)
+            // Pattern 5: ALL CAPS institution header (PSG COLLEGE OF TECHNOLOGY, etc.)
             if (!organizer) {
                 const headerMatch = fullText.match(/\b([A-Z]{2,}(?:\s+[A-Z]+)*\s+(?:COLLEGE|INSTITUTE|UNIVERSITY)\s+OF\s+[A-Z]+)\b/);
                 if (headerMatch) {
                     organizer = headerMatch[1].trim();
                     if (organizer.length > 50) organizer = organizer.substring(0, 50);
+                }
+            }
+
+            // Pattern 6: "organized by" with relaxed ending
+            if (!organizer) {
+                const orgRelaxed = fullText.match(/(?:organized|organised|hosted|conducted)\s+by\s+(?:the\s+)?([A-Z][A-Za-z\s&]+?)(?:\s+on\s+|\s+at\s+|\s+from\s+|\s+during\s+|\.|\s*$)/i);
+                if (orgRelaxed && orgRelaxed[1].trim().length > 3) {
+                    organizer = orgRelaxed[1].trim();
                 }
             }
 
@@ -833,36 +862,49 @@ const API = {
 
             // Pattern 2: Full workshop/training name with topic
             if (!degree) {
-                const workshopMatch = fullText.match(/((?:FIVE|FOUR|THREE|TWO|ONE|\d+)[\s-]?DAY[S]?\s+(?:HANDS[\s-]?ON\s+)?(?:WORKSHOP|TRAINING|COURSE|BOOTCAMP)\s+ON\s+[A-Za-z\s\-&"]+?)(?:\s*organized|\s*conducted|\s*,|\s*"|\s*by)/i);
+                const workshopMatch = fullText.match(/((?:FIVE|FOUR|THREE|TWO|ONE|\d+)[\s-]?DAY[S]?\s+(?:HANDS[\s-]?ON\s+)?(?:WORKSHOP|TRAINING|COURSE|BOOTCAMP)\s+(?:ON|IN|FOR|ABOUT)\s+[A-Za-z\s\-&"']+?)(?:\s*organized|\s*conducted|\s*,|\s*"|\s*by|\s*held|\s*at)/i);
                 if (workshopMatch) {
-                    degree = workshopMatch[1].trim();
-                    // Clean up trailing quotes or garbage
-                    degree = degree.replace(/["']$/, '').trim();
+                    degree = workshopMatch[1].trim().replace(/["']$/, '').trim();
                 }
             }
 
-            // Pattern 3: Workshop with "IOT DEVICE PROGRAMMING" or similar topic
+            // Pattern 3: "Workshop/Training on TOPIC"
             if (!degree) {
-                const topicMatch = fullText.match(/(?:WORKSHOP|TRAINING|BOOTCAMP|COURSE)\s+ON\s+"?([A-Z][A-Z\s&-]+)"?/i);
+                const topicMatch = fullText.match(/(?:WORKSHOP|TRAINING|BOOTCAMP|COURSE|SEMINAR|WEBINAR|HACKATHON)\s+(?:ON|IN|FOR|ABOUT)\s+"?([A-Z][A-Za-z\s&\-]+)"?/i);
                 if (topicMatch) {
                     degree = `Workshop on ${topicMatch[1].trim()}`;
                 }
             }
 
-            // Pattern 4: Look for BOOTCAMP, WORKSHOP, etc. with context
+            // Pattern 4: "has participated in EVENT/WORKSHOP"
             if (!degree) {
-                const bootcampMatch = fullText.match(/(INTERNET\s+OF\s+THINGS|IOT|AI|ML|MACHINE\s+LEARNING|DATA\s+SCIENCE|WEB\s+DEVELOPMENT|[A-Z\s]+)\s*(?:BOOTCAMP|WORKSHOP|TRAINING)/i);
+                const participatedMatch = fullText.match(/(?:participated|enrolled|taken\s+part)\s+in\s+(?:the\s+)?(?:a\s+)?([A-Za-z][A-Za-z\s\-&"']+?)(?:\s+organized|\s+conducted|\s+held|\s+at|\s+on\s+\d|\s*,|\s*\.)/i);
+                if (participatedMatch && participatedMatch[1].trim().length > 3) {
+                    degree = participatedMatch[1].trim().replace(/["']$/, '').trim();
+                }
+            }
+
+            // Pattern 5: "completed COURSE/PROGRAM"
+            if (!degree) {
+                const completedMatch = fullText.match(/(?:completed|finished|passed)\s+(?:the\s+)?(?:a\s+)?([A-Za-z][A-Za-z\s\-&"']+?)(?:\s+organized|\s+conducted|\s+held|\s+at|\s+on\s+\d|\s*,|\s*\.)/i);
+                if (completedMatch && completedMatch[1].trim().length > 3) {
+                    degree = completedMatch[1].trim().replace(/["']$/, '').trim();
+                }
+            }
+
+            // Pattern 6: TOPIC + BOOTCAMP/WORKSHOP/TRAINING
+            if (!degree) {
+                const bootcampMatch = fullText.match(/((?:INTERNET\s+OF\s+THINGS|IOT|AI|ML|MACHINE\s+LEARNING|DATA\s+SCIENCE|WEB\s+DEVELOPMENT|CLOUD\s+COMPUTING|CYBER\s+SECURITY|BLOCK\s*CHAIN|PYTHON|JAVA|FULL\s+STACK|DEEP\s+LEARNING)[A-Z\s]*)\s*(?:BOOTCAMP|WORKSHOP|TRAINING|HACKATHON|COURSE)/i);
                 if (bootcampMatch) {
                     degree = `${bootcampMatch[1].trim()} Workshop`;
                 }
             }
 
-            // Pattern 5: Certificate type with event name
+            // Pattern 7: Certificate type
             if (!degree) {
                 const certTypeMatch = fullText.match(/CERTIFICATE\s+OF\s+(PARTICIPATION|APPRECIATION|COMPLETION|ACHIEVEMENT|EXCELLENCE|MERIT)/i);
                 if (certTypeMatch) {
-                    // Try to append event name if found
-                    const eventName = fullText.match(/(?:edition\s+of\s+|event\s+|fest\s+)([A-Z][A-Z0-9]+)/i);
+                    const eventName = fullText.match(/(?:edition\s+of\s+|event\s+|fest\s+|for\s+)([A-Z][A-Z0-9]+)/i);
                     if (eventName) {
                         degree = `Certificate of ${certTypeMatch[1]} - ${eventName[1]}`;
                     } else {
@@ -871,33 +913,62 @@ const API = {
                 }
             }
 
-            // Pattern 6: Simpler fallbacks with more context
+            // Pattern 8: Academic degree (B.E, M.Tech, B.Tech, M.Sc, PhD, etc.)
             if (!degree) {
-                if (fullText.toLowerCase().includes('hands-on') && fullText.toLowerCase().includes('workshop')) {
-                    degree = "Hands-On Workshop";
-                } else if (fullText.toLowerCase().includes('workshop')) {
-                    degree = "Workshop";
-                } else if (fullText.toLowerCase().includes('bootcamp')) {
-                    degree = "Bootcamp";
-                } else if (fullText.toLowerCase().includes('training')) {
-                    degree = "Training Program";
-                } else if (fullText.toLowerCase().includes('participation')) {
-                    degree = "Certificate of Participation";
-                } else if (fullText.toLowerCase().includes('appreciation')) {
-                    degree = "Certificate of Appreciation";
+                const degreeMatch = fullText.match(/\b(B\.?\s*E\.?|B\.?\s*Tech|M\.?\s*Tech|B\.?\s*Sc|M\.?\s*Sc|B\.?\s*C\.?\s*A|M\.?\s*C\.?\s*A|B\.?\s*B\.?\s*A|M\.?\s*B\.?\s*A|Ph\.?\s*D|B\.?\s*Com|M\.?\s*Com)\b\.?\s*(?:in\s+)?([A-Za-z\s&]+)?/i);
+                if (degreeMatch) {
+                    const degreeName = degreeMatch[1].trim();
+                    const specialization = degreeMatch[2] ? degreeMatch[2].trim().replace(/\s+(has|from|of|at|the)\s*$/i, '') : '';
+                    degree = specialization ? `${degreeName} in ${specialization}` : degreeName;
                 }
             }
 
-            // Pattern 7: Register/Certificate Number (alphanumeric codes)
-            const regMatch = fullText.match(/(?:Certificate\s*No|Reg(?:ister)?\s*(?:No|Number)|ID\s*(?:No)?|Roll\s*No)[\.:]*\s*([A-Z0-9\-\/]+)/i);
+            // Pattern 9: Simpler keyword fallbacks
+            if (!degree) {
+                const lowerText = fullText.toLowerCase();
+                if (lowerText.includes('hands-on') && lowerText.includes('workshop')) {
+                    degree = "Hands-On Workshop";
+                } else if (lowerText.includes('workshop')) {
+                    degree = "Workshop";
+                } else if (lowerText.includes('hackathon')) {
+                    degree = "Hackathon";
+                } else if (lowerText.includes('bootcamp')) {
+                    degree = "Bootcamp";
+                } else if (lowerText.includes('training')) {
+                    degree = "Training Program";
+                } else if (lowerText.includes('seminar')) {
+                    degree = "Seminar";
+                } else if (lowerText.includes('webinar')) {
+                    degree = "Webinar";
+                } else if (lowerText.includes('participation')) {
+                    degree = "Certificate of Participation";
+                } else if (lowerText.includes('appreciation')) {
+                    degree = "Certificate of Appreciation";
+                } else if (lowerText.includes('completion')) {
+                    degree = "Certificate of Completion";
+                }
+            }
+
+            // =============================================
+            // REGISTER NUMBER EXTRACTION
+            // =============================================
+            // Pattern 1: Labelled register/certificate number
+            const regMatch = fullText.match(/(?:Certificate\s*No|Reg(?:ister)?\s*(?:No|Number|\.?\s*No)|ID\s*(?:No)?|Roll\s*No|Enrollment\s*No|Enrol(?:ment)?\s*No|Admission\s*No)[\.:\s]*\s*([A-Z0-9\-\/]+)/i);
             if (regMatch) {
                 reg = regMatch[1].trim();
             }
-            // Fallback: Look for patterns like "2025W020034" or similar
+            // Pattern 2: Patterns like "2025W020034" or similar codes
             if (!reg) {
                 const codeMatch = fullText.match(/\b(\d{4}[A-Z]\d{5,})\b/);
                 if (codeMatch) {
                     reg = codeMatch[1];
+                }
+            }
+            // Pattern 3: Alphanumeric ID patterns (e.g., "REG-12345", "RA2211003010123")
+            if (!reg) {
+                const alphaNumMatch = fullText.match(/\b([A-Z]{2,4}\d{6,})\b/);
+                if (alphaNumMatch) {
+                    reg = alphaNumMatch[1];
                 }
             }
 
