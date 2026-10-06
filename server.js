@@ -231,11 +231,15 @@ app.post(['/api/ocr', '/ocr'], upload.single('certificate'), async (req, res) =>
     }
 });
 
-// Start Express server
-app.listen(PORT, () => {
-    console.log(`=======================================================`);
-    console.log(`🚀 CertValid Backend Server running on http://localhost:${PORT}`);
-    console.log(`📄 Gemini OCR Endpoint: http://localhost:${PORT}/api/ocr`);
-    console.log(`🔑 Gemini API Key configured: ${Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'YOUR_GEMINI_API_KEY')}`);
-    console.log(`=======================================================`);
-});
+// Start Express server locally if not in Vercel serverless environment
+if (!process.env.VERCEL) {
+    app.listen(PORT, () => {
+        console.log(`=======================================================`);
+        console.log(`🚀 CertValid Backend Server running on http://localhost:${PORT}`);
+        console.log(`📄 Gemini OCR Endpoint: http://localhost:${PORT}/api/ocr`);
+        console.log(`🔑 Gemini API Key configured: ${Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'YOUR_GEMINI_API_KEY')}`);
+        console.log(`=======================================================`);
+    });
+}
+
+module.exports = app;
