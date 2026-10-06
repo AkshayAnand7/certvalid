@@ -15,6 +15,11 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Serve static frontend files from current directory
 app.use(express.static(__dirname));
 
+// Explicit route for root index.html
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
+
 // Configure Multer for in-memory file uploads (max 10MB)
 const storage = multer.memoryStorage();
 const upload = multer({
