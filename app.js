@@ -620,7 +620,8 @@ const API = {
                     return result;
                 }
             } else {
-                console.warn(`[GEMINI] Backend returned HTTP ${response.status}. Falling back to Tesseract OCR...`);
+                const errText = await response.text();
+                console.warn(`[GEMINI] Backend returned HTTP ${response.status}: ${errText}. Falling back to Tesseract OCR...`);
             }
         } catch (geminiError) {
             console.warn(`[GEMINI] Backend unavailable (${geminiError.message}). Falling back to local Tesseract OCR...`);
