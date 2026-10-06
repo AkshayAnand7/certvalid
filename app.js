@@ -574,360 +574,655 @@ const API = {
     },
 
     ocrExtract: async (imageInput) => {
-        console.log(`[OCR] Analyzing image using Tesseract.js...`);
+        console.log(`[OCR] Starting certificate information extraction pipeline...`);
 
-        if (!window.Tesseract) {
-            console.warn("Tesseract.js not loaded. Please check internet connection.");
-            return { name: "", registerNumber: "", institution: "", degree: "" };
+        // ============================================================
+        // 1. PRIMARY EXTRACTION: GOOGLE GEMINI VISION API (via Backend)
+        // ============================================================
+        try {
+            console.log(`[GEMINI] Sending certificate to Node.js backend (/api/ocr)...`);
+
+            let backendUrl = '/api/ocr';
+            if (window.location.protocol === 'file:' || (window.location.port && window.location.port !== '5000')) {
+                backendUrl = 'http://localhost:5000/api/ocr';
+            }
+
+            const response = await fetch(backendUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: imageInput })
+            });
+
+            if (response.ok) {
+                const resData = await response.json();
+                if (resData && resData.success && resData.data) {
+                    const d = resData.data;
+                    console.log(`[GEMINI] ✅ Response received & parsed successfully:`, d);
+
+                    const yearMatch = (d.date && d.date.match(/\b(20\d{2}|19\d{2})\b/));
+                    const yearVal = yearMatch ? yearMatch[1] : new Date().getFullYear().toString();
+
+                    const result = {
+                        name: d.name || "",
+                        registerNumber: d.registerNumber || d.certificateId || "",
+                        certificateId: d.certificateId || d.registerNumber || "",
+                        institution: d.institution || "",
+                        organizer: d.organizer || "",
+                        degree: d.course || "",
+                        course: d.course || "",
+                        year: yearVal,
+                        date: d.date || "",
+                        gpa: "",
+                        ocrSource: "gemini"
+                    };
+
+                    console.log(`[GEMINI] Extracted structured fields:`, result);
+                    return result;
+                }
+            } else {
+                console.warn(`[GEMINI] Backend returned HTTP ${response.status}. Falling back to Tesseract OCR...`);
+            }
+        } catch (geminiError) {
+            console.warn(`[GEMINI] Backend unavailable (${geminiError.message}). Falling back to local Tesseract OCR...`);
         }
 
-        try {
-            let imageToProcess = imageInput;
+        // ============================================================
+        // 2. FALLBACK EXTRACTION: TESSERACT.JS OCR PIPELINE
+        // ============================================================
+        console.log(`[OCR] Running local Tesseract.js fallback pipeline...`);
 
-            // Check if input is a PDF and convert to image using PDF.js
-            if (typeof imageInput === 'string' &&
-                (imageInput.includes('application/pdf') || imageInput.startsWith('JVBER'))) {
-                console.log("[OCR] PDF detected, converting to image using PDF.js...");
+        if (!window.Tesseract) {
+            console.warn("[OCR] Tesseract.js not loaded. Please check internet connection.");
+            return { name: "", registerNumber: "", certificateId: "", institution: "", organizer: "", degree: "", course: "", year: new Date().getFullYear().toString(), date: "", gpa: "", ocrSource: "failed" };
+        }
 
-                if (!window.pdfjsLib) {
-                    throw new Error("PDF.js not loaded. Cannot process PDF files.");
+        // Helper to load image from source URL/base64
+        const loadImage = (src) => {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.crossOrigin = "anonymous";
+                img.onload = () => resolve(img);
+                img.onerror = (err) => reject(new Error("Failed to load image for OCR preprocessing: " + err));
+                img.src = src;
+            });
+        };
+
+        // Canvas preprocessor with multi-filter enhancements (grayscale, contrast stretching, sharpening, binarization)
+        const preprocessCanvas = (img, filterMode = 'enhanced') => {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+
+            // 1. Resolution Normalization: Upscale low-res images for sharper OCR
+            let width = img.width || img.naturalWidth;
+            let height = img.height || img.naturalHeight;
+            let scale = 1.0;
+
+            if (width < 1800) {
+                scale = Math.min(3.0, 2000 / width);
+            } else if (width > 3200) {
+                scale = 2400 / width;
+            }
+
+            canvas.width = Math.round(width * scale);
+            canvas.height = Math.round(height * scale);
+
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imgData.data;
+            const len = data.length;
+
+            if (filterMode === 'enhanced' || filterMode === 'sharpen') {
+                // Step A: Grayscale with standard luminance weights
+                const gray = new Uint8ClampedArray(len / 4);
+                let min = 255;
+                let max = 0;
+
+                for (let i = 0, j = 0; i < len; i += 4, j++) {
+                    // Standard Rec. 601 Luma
+                    const luma = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+                    gray[j] = luma;
+                    if (luma < min) min = luma;
+                    if (luma > max) max = luma;
                 }
 
-                // Extract base64 data
+                // Step B: Adaptive Contrast Stretching (Histogram normalization)
+                const range = (max - min) || 1;
+                for (let i = 0, j = 0; i < len; i += 4, j++) {
+                    const stretched = Math.round(((gray[j] - min) / range) * 255);
+                    data[i] = stretched;
+                    data[i + 1] = stretched;
+                    data[i + 2] = stretched;
+                    // data[i+3] is alpha (unchanged)
+                }
+
+                ctx.putImageData(imgData, 0, 0);
+
+                // Step C: Apply Sharpening Convolution Filter for blurry/low-contrast text
+                if (filterMode === 'sharpen') {
+                    const sharpData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    const sData = sharpData.data;
+                    const w = canvas.width;
+                    const h = canvas.height;
+                    const copy = new Uint8ClampedArray(sData);
+
+                    // 3x3 unsharp sharpening kernel: [0, -0.5, 0, -0.5, 3.0, -0.5, 0, -0.5, 0]
+                    for (let y = 1; y < h - 1; y++) {
+                        for (let x = 1; x < w - 1; x++) {
+                            const idx = (y * w + x) * 4;
+                            const top = ((y - 1) * w + x) * 4;
+                            const bottom = ((y + 1) * w + x) * 4;
+                            const left = (y * w + (x - 1)) * 4;
+                            const right = (y * w + (x + 1)) * 4;
+
+                            const val = (3.0 * copy[idx]) - (0.5 * (copy[top] + copy[bottom] + copy[left] + copy[right]));
+                            const clamped = Math.min(255, Math.max(0, val));
+                            sData[idx] = clamped;
+                            sData[idx + 1] = clamped;
+                            sData[idx + 2] = clamped;
+                        }
+                    }
+                    ctx.putImageData(sharpData, 0, 0);
+                }
+            } else if (filterMode === 'binarize') {
+                // Adaptive / Otsu-like Thresholding for colored backgrounds / stamps
+                let sum = 0;
+                const gray = new Uint8ClampedArray(len / 4);
+                for (let i = 0, j = 0; i < len; i += 4, j++) {
+                    const luma = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+                    gray[j] = luma;
+                    sum += luma;
+                }
+                const avg = sum / (len / 4);
+                const threshold = avg * 0.88; // Slightly biased towards background removal
+
+                for (let i = 0, j = 0; i < len; i += 4, j++) {
+                    const val = gray[j] > threshold ? 255 : 0;
+                    data[i] = val;
+                    data[i + 1] = val;
+                    data[i + 2] = val;
+                }
+                ctx.putImageData(imgData, 0, 0);
+            }
+
+            return canvas.toDataURL('image/png');
+        };
+
+        try {
+            let processedImages = [];
+            let extractedNativeText = "";
+
+            // ============================================================
+            // 2. INPUT NORMALIZATION & MULTI-PAGE PDF HANDLING
+            // ============================================================
+            const isPdf = typeof imageInput === 'string' &&
+                (imageInput.includes('application/pdf') || imageInput.startsWith('JVBER') || imageInput.startsWith('data:application/pdf'));
+
+            if (isPdf) {
+                console.log("[OCR] PDF detected. Processing pages & extracting text layers...");
+                if (!window.pdfjsLib) {
+                    throw new Error("PDF.js library not loaded. Cannot process PDF document.");
+                }
+
                 let pdfBase64 = imageInput;
                 if (imageInput.includes(',')) {
                     pdfBase64 = imageInput.split(',')[1];
                 }
 
-                // Decode base64 to Uint8Array
                 const pdfData = atob(pdfBase64);
                 const pdfArray = new Uint8Array(pdfData.length);
                 for (let i = 0; i < pdfData.length; i++) {
                     pdfArray[i] = pdfData.charCodeAt(i);
                 }
 
-                // Load PDF
                 const pdf = await pdfjsLib.getDocument({ data: pdfArray }).promise;
-                console.log(`[OCR] PDF loaded with ${pdf.numPages} page(s)`);
+                const totalPages = Math.min(pdf.numPages, 5); // Process up to 5 pages
+                console.log(`[OCR] PDF loaded successfully with ${pdf.numPages} page(s). Processing ${totalPages} page(s)...`);
 
-                // Render first page to canvas
-                const page = await pdf.getPage(1);
-                const scale = 2.0; // Higher scale for better OCR
-                const viewport = page.getViewport({ scale });
+                for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+                    const page = await pdf.getPage(pageNum);
 
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                canvas.width = viewport.width;
-                canvas.height = viewport.height;
+                    // Try native PDF text layer first (100% precision for digital PDFs)
+                    try {
+                        const textContent = await page.getTextContent();
+                        if (textContent && textContent.items && textContent.items.length > 0) {
+                            const pageNativeText = textContent.items.map(item => item.str).join(' ');
+                            if (pageNativeText.trim().length > 30) {
+                                extractedNativeText += " \n " + pageNativeText;
+                                console.log(`[OCR] Extracted native vector text from PDF page ${pageNum} (${pageNativeText.length} chars)`);
+                            }
+                        }
+                    } catch (e) {
+                        console.warn(`[OCR] Native text extraction skipped for page ${pageNum}:`, e);
+                    }
 
-                await page.render({
-                    canvasContext: ctx,
-                    viewport: viewport
-                }).promise;
+                    // Render page at high DPI for image OCR
+                    const scale = 2.5; // High resolution rendering
+                    const viewport = page.getViewport({ scale });
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    canvas.width = viewport.width;
+                    canvas.height = viewport.height;
 
-                // Convert canvas to data URL for Tesseract
-                imageToProcess = canvas.toDataURL('image/png');
-                console.log("[OCR] PDF converted to image successfully");
+                    await page.render({
+                        canvasContext: ctx,
+                        viewport: viewport
+                    }).promise;
+
+                    processedImages.push(canvas.toDataURL('image/png'));
+                }
+            } else {
+                // Input is standard image (PNG, JPG, WebP, etc.)
+                processedImages.push(imageInput);
             }
 
-            // Tesseract.js Worker
-            const { data: { text } } = await Tesseract.recognize(
-                imageToProcess,
-                'eng',
-                { logger: m => console.log(`[OCR] ${m.status}: ${Math.round(m.progress * 100)}%`) }
-            );
+            // ============================================================
+            // 3. MULTI-PASS OCR RECOGNITION
+            // ============================================================
+            let combinedOcrText = extractedNativeText || "";
 
-            console.log("OCR Raw Text:", text);
-            const fullText = text.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ');
-            const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 2);
+            for (let i = 0; i < processedImages.length; i++) {
+                const rawImgSrc = processedImages[i];
+                let loadedImg;
+                try {
+                    loadedImg = await loadImage(rawImgSrc);
+                } catch (imgLoadErr) {
+                    console.warn("[OCR] Error loading image for canvas preprocessing:", imgLoadErr);
+                }
 
-            // Smart extraction patterns
-            let name = "";
-            let inst = "";
-            let organizer = "";
-            let degree = "";
-            let reg = "";
+                // Pass 1: Enhanced Grayscale + Sharpened
+                const enhancedSrc = loadedImg ? preprocessCanvas(loadedImg, 'sharpen') : rawImgSrc;
 
-            // Helper: Clean extracted text
-            const cleanText = (str) => {
+                console.log(`[OCR] Running Tesseract recognition on image/page ${i + 1}...`);
+                const { data: { text, confidence } } = await Tesseract.recognize(
+                    enhancedSrc,
+                    'eng',
+                    { logger: m => console.log(`[OCR P${i + 1}] ${m.status}: ${Math.round((m.progress || 0) * 100)}%`) }
+                );
+
+                console.log(`[OCR Page ${i + 1} Raw Text] (Confidence: ${confidence}%):\n`, text);
+                combinedOcrText += " \n " + text;
+
+                // Fallback Pass 2: If confidence is very low (< 50) and image was preprocessed, try binarized pass
+                if (confidence < 50 && loadedImg) {
+                    console.log(`[OCR] Low confidence (${confidence}%). Running secondary binarized pass...`);
+                    const binarizedSrc = preprocessCanvas(loadedImg, 'binarize');
+                    try {
+                        const pass2Result = await Tesseract.recognize(binarizedSrc, 'eng');
+                        if (pass2Result && pass2Result.data && pass2Result.data.text) {
+                            console.log(`[OCR Page ${i + 1} Pass 2 Text]:\n`, pass2Result.data.text);
+                            combinedOcrText += " \n " + pass2Result.data.text;
+                        }
+                    } catch (p2Err) {
+                        console.warn("[OCR] Pass 2 failed:", p2Err);
+                    }
+                }
+            }
+
+            // ============================================================
+            // 4. TEXT NORMALIZATION & PREPARATION
+            // ============================================================
+            const rawCombined = combinedOcrText;
+            // Clean up strange OCR glyphs & artifacts
+            const sanitizedText = rawCombined
+                .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+                .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+                .replace(/[|]/g, ' ')
+                .replace(/[—–]/g, '-');
+
+            const fullText = sanitizedText.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+            const lines = sanitizedText
+                .split('\n')
+                .map(l => l.replace(/\s+/g, ' ').trim())
+                .filter(l => l.length > 2);
+
+            console.log("[OCR Cleaned FullText]:", fullText);
+            console.log("[OCR Lines Array]:", lines);
+
+            // ============================================================
+            // 5. SMART ENTITY EXTRACTION ENGINE
+            // ============================================================
+
+            // Helper: Clean extracted string
+            const cleanString = (str) => {
                 if (!str) return "";
-                // Remove common garbage phrases
                 return str
-                    .replace(/\s*(This is to certify|This certificate is|certificate is presented|is presented to|presented to)\s*/gi, '')
-                    .replace(/\s*(of|from|has|for)\s*$/i, '')
-                    .replace(/^\s*(Mr\.|Ms\.|Mrs\.|Miss\.?)\s*/i, '')
+                    .replace(/^[\s\:\-\.\,\;\"\'\(\)]+/, '')
+                    .replace(/[\s\:\-\.\,\;\"\'\(\)]+$/, '')
                     .replace(/\s+/g, ' ')
                     .trim();
             };
 
-            // =============================================
-            // IMPROVED NAME EXTRACTION PATTERNS
-            // =============================================
+            // Helper: Clean Person Name
+            const cleanName = (str) => {
+                if (!str) return "";
+                let res = str
+                    .replace(/^(?:This\s+(?:is\s+to\s+)?certif(?:y|ies|ied)\s+that|This\s+certificate\s+is\s+(?:proudly\s+)?presented\s+to|Proudly\s+presented\s+to|Presented\s+to|Awarded\s+to|Conferred\s+upon|Given\s+to|Honors\s+bestowed\s+on|Certifies\s+that)\s*/i, '')
+                    .replace(/^(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Dr\.?|Prof\.?|Shri\.?|Smt\.?|Mx\.?|Master)\s*/i, '')
+                    .replace(/^(?:Mr\.?\s*\/\s*Ms\.?|Ms\.?\s*\/\s*Mr\.?|Mr\s*\/\s*Ms)\s*/i, '')
+                    .replace(/^(?:Candidate|Student|Participant|Recipient|Awardee)?\s*Name\s*[:\-\.]*\s*/i, '')
+                    .replace(/\s+(?:of|from|bearing|with|having|holding|son\s+of|daughter\s+of|student\s+of|a\s+student|for|has|in|who|successfully|participated|completed|attended|secured|awarded|representing|dated|on|during|the|and)\b.*$/i, '')
+                    .replace(/[\d\:\;\(\)\[\]\{\}\*\#\$\@\^\_\+\=\<\>\/\\]/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
 
-            // Pattern 1: ALL CAPS names (common in certificates) - more flexible
-            const capsNameMatch = fullText.match(/(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|to|that)\s+([A-Z][A-Z\s\.]{2,40}?)(?:\s+of\s+|\s+from\s+|\s+for\s+|\s+has\s+|\s+bearing\s+|\s+with\s+|\s+a\s+student|\s*,)/);
-            if (capsNameMatch) {
-                name = cleanText(capsNameMatch[1]);
-            }
+                // Strip leading/trailing non-letters
+                res = res.replace(/^[^a-zA-Z]+/, '').replace(/[^a-zA-Z\.]+$/, '').trim();
+                return res;
+            };
 
-            // Pattern 2: "certify that [Title] NAME" - more flexible ending
-            if (!name) {
-                const certifyMatch = fullText.match(/certif(?:y|ies|ied)\s+that\s+(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)?\s*([A-Z][A-Za-z\s\.]+?)(?:\s+of\s+|\s+from\s+|\s+has\s+|\s+for\s+|\s+bearing\s+|\s+with\s+|\s+a\s+student|\s*,)/i);
-                if (certifyMatch) {
-                    name = cleanText(certifyMatch[1]);
+            // Helper: Clean Institution Name
+            const cleanInstitution = (str) => {
+                if (!str) return "";
+                let res = str
+                    .replace(/^(?:student\s+of|studying\s+(?:in|at)|from|of|at)\s+/i, '')
+                    .replace(/\s+(?:has\s+participated|has\s+completed|has\s+attended|participated|completed|attended|for|on|in|during|dated|with|bearing|held\s+at)\b.*$/i, '')
+                    .replace(/^(?:institution|college|university|school)\s*[:\-\.]*\s*/i, '')
+                    .replace(/[\:\;\(\)\[\]\{\}\*\#\$\@\^\_\+\=\<\>]/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+                res = res.replace(/^[^a-zA-Z]+/, '').replace(/[^a-zA-Z\.\)]+$/, '').trim();
+                return res;
+            };
+
+            let name = "";
+            let institution = "";
+            let organizer = "";
+            let degree = "";
+            let registerNumber = "";
+            let year = "";
+            let gpa = "";
+
+            // ------------------------------------------------------------
+            // A. NAME EXTRACTION (Multi-Pattern & Line Heuristics)
+            // ------------------------------------------------------------
+
+            const namePatterns = [
+                // Pattern 1: Explicit labels like "Name: JOHN DOE" or "Student Name: CHANDRU T"
+                /(?:(?:Candidate|Student|Participant|Recipient|Awardee)?\s*Name)\s*[:\-\.\|]\s*([A-Z][A-Za-z\s\.\'\`\-]{2,45})/i,
+
+                // Pattern 2: "Mr./Ms. NAME" or combined slash format "Mr./Ms. KIRUTHIGA N"
+                /(?:Mr\.?\s*\/\s*Ms\.?|Ms\.?\s*\/\s*Mr\.?|Mr\s*\/\s*Ms)\s+([A-Z][A-Za-z\s\.\'\`\-]{2,40}?)(?=\s+(?:of|from|bearing|with|having|student|for|has|in|who|participated|\,|\.|\n|$))/i,
+
+                // Pattern 3: Standard Titles: "Mr. AKSHAY ANAND M P" or "Ms. SARAH CONNOR"
+                /(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Dr\.?|Prof\.?|Shri\.?|Smt\.?|Mx\.?)\s+([A-Z][A-Za-z\s\.\'\`\-]{2,40}?)(?=\s+(?:of|from|bearing|with|having|student|for|has|in|who|participated|\,|\.|\n|$))/i,
+
+                // Pattern 4: "certify that [Title] NAME of/from/bearing"
+                /(?:certif(?:y|ies|ied)\s+that|certifies\s+that)\s+(?:(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Dr\.?|Prof\.?|Shri\.?|Smt\.?|Mr\.?\s*\/\s*Ms\.?)\s*)?([A-Z][A-Za-z\s\.\'\`\-]{2,45}?)(?=\s+(?:of|from|bearing|with|having|student|a\s+student|son\s+of|daughter\s+of|for|has|who|successfully|\,|\.|\n|$))/i,
+
+                // Pattern 5: "presented to / awarded to / conferred upon NAME"
+                /(?:presented\s+to|awarded\s+to|conferred\s+upon|given\s+to|proudly\s+presented\s+to|honors\s+bestowed\s+on)\s+(?:(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Dr\.?|Prof\.?|Shri\.?|Smt\.?|Mr\.?\s*\/\s*Ms\.?)\s*)?([A-Z][A-Za-z\s\.\'\`\-]{2,45}?)(?=\s+(?:of|from|bearing|with|having|student|for|has|in|who|successfully|a\s+student|\,|\.|\n|$))/i,
+
+                // Pattern 6: Name immediately preceding register number ("AKSHAY ANAND bearing Reg No...")
+                /([A-Z][A-Za-z\s\.\'\`\-]{2,40}?)\s+(?:bearing|with|having|holding)\s+(?:Reg(?:ister)?|Roll|ID|Enrollment|USN)/i
+            ];
+
+            for (const pat of namePatterns) {
+                const match = fullText.match(pat);
+                if (match && match[1]) {
+                    const cleaned = cleanName(match[1]);
+                    // Filter out invalid phrases (e.g. institution or cert words)
+                    if (cleaned.length >= 2 && !/certificate|participation|technology|college|university|institute|department|workshop|bootcamp/i.test(cleaned)) {
+                        name = cleaned;
+                        break;
+                    }
                 }
             }
 
-            // Pattern 2b: Handle "Mr./Ms." combined format (common in Indian certificates)
-            // Also handles single-letter initials like "Kiruthiga N" or "AKSHAY ANAND M P"
-            if (!name) {
-                const mrMsMatch = fullText.match(/(?:Mr\.?\s*\/\s*Ms\.?|Ms\.?\s*\/\s*Mr\.?)\s+([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)*?)(?:\s+of\s+|\s+from\s+|\s+has\s+|\s+for\s+|\s+bearing\s+|\s*,)/i);
-                if (mrMsMatch) {
-                    name = cleanText(mrMsMatch[1]);
-                }
-            }
-
-            // Pattern 3: "presented to" or "awarded to" - more flexible
-            if (!name) {
-                const presentedMatch = fullText.match(/(?:presented\s+to|awarded\s+to|granted\s+to|given\s+to)\s+(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?)?\s*([A-Z][A-Za-z\s\.]+?)(?:\s+of\s+|\s+from\s+|\s+for\s+|\s+bearing\s+|\s+a\s+student|\s*,)/i);
-                if (presentedMatch) {
-                    name = cleanText(presentedMatch[1]);
-                }
-            }
-
-            // Pattern 4: Look for "Mr./Ms./Mrs. NAME" anywhere in text
-            if (!name) {
-                const titleMatch = fullText.match(/(?:Mr\.?|Ms\.?|Mrs\.?|Miss\.?|Shri\.?|Smt\.?)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})(?:\s+of\s+|\s+from\s+|\s+has\s+|\s+bearing\s+|\s+a\s+student|\s*,)/i);
-                if (titleMatch) {
-                    name = cleanText(titleMatch[1]);
-                }
-            }
-
-            // Pattern 5: Look for name near register number (common format: "NAME bearing Reg No: XXX")
-            if (!name) {
-                const bearingMatch = fullText.match(/([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})\s+(?:bearing|with|having)\s+(?:Reg|Register|Roll|ID)/i);
-                if (bearingMatch) {
-                    name = cleanText(bearingMatch[1]);
-                }
-            }
-
-            // Pattern 6: Line-by-line search for names (look for capitalized words after certify lines)
+            // Fallback: Line-by-line inspection for standalone recipient name
             if (!name) {
                 for (let i = 0; i < lines.length; i++) {
                     const line = lines[i];
-                    // Skip institutional/organizational lines
-                    if (/college|university|institute|technology|department|centre|center|conducted|organized|association/i.test(line)) continue;
-                    // Skip certificate type lines
-                    if (/certificate|participation|appreciation|completion|achievement/i.test(line)) continue;
-                    // Skip date/year lines
-                    if (/\b(20\d{2}|january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(line)) continue;
-                    // Skip register number lines
-                    if (/\b\d{5,}\b/.test(line)) continue;
+                    // Skip obvious header, metadata, or footer lines
+                    if (/college|university|institute|technology|department|centre|center|conducted|organized|association|academy|school/i.test(line)) continue;
+                    if (/certificate|participation|appreciation|completion|achievement|excellence|merit|attendance|recognition/i.test(line)) continue;
+                    if (/\b(20\d{2}|january|february|march|april|may|june|july|august|september|october|november|december|date|reg\s*no|roll\s*no|id\s*no)\b/i.test(line)) continue;
+                    if (/\d{4,}/.test(line)) continue;
 
-                    // Look for proper name pattern (2-4 capitalized words)
-                    const nameMatch = line.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})$/);
-                    if (nameMatch) {
-                        name = nameMatch[1].trim();
-                        break;
+                    // Standalone ALL CAPS name line (e.g., "CHANDRU T" or "KIRUTHIGA N" or "AKSHAY ANAND M P")
+                    const allCapsMatch = line.match(/^([A-Z][A-Z\s\.]{2,35})$/);
+                    if (allCapsMatch) {
+                        const cleaned = cleanName(allCapsMatch[1]);
+                        if (cleaned.length >= 2 && !/CERTIFICATE|COLLEGE|UNIVERSITY|INSTITUTE|TECHNOLOGY|DEPARTMENT|WORKSHOP|BOOTCAMP|PROGRAMME|PROJECT/i.test(cleaned)) {
+                            name = cleaned;
+                            break;
+                        }
                     }
 
-                    // Also check for ALL CAPS name on its own line
-                    const capsMatch = line.match(/^([A-Z][A-Z\s\.]{5,35})$/);
-                    if (capsMatch && !/CERTIFICATE|COLLEGE|UNIVERSITY|INSTITUTE|TECHNOLOGY|DEPARTMENT/i.test(capsMatch[1])) {
-                        name = capsMatch[1].trim();
-                        break;
-                    }
-                }
-            }
-
-            // Pattern 7: Look for any proper noun sequence (2-4 capitalized words together)
-            if (!name) {
-                const properNounMatch = fullText.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(?:of|from|has|a\s+student)/);
-                if (properNounMatch) {
-                    // Make sure it's not an institution name
-                    if (!/college|university|institute|technology/i.test(properNounMatch[1])) {
-                        name = properNounMatch[1].trim();
+                    // Standalone Title Case name line (e.g., "John Doe" or "Kiruthiga N")
+                    const titleCaseMatch = line.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-zA-Z\.]*){1,4})$/);
+                    if (titleCaseMatch) {
+                        const cleaned = cleanName(titleCaseMatch[1]);
+                        if (cleaned.length >= 3 && !/Certificate|Participation|Appreciation|Completion|Technology|College|University/i.test(cleaned)) {
+                            name = cleaned;
+                            break;
+                        }
                     }
                 }
             }
 
-            // =============================================
-            // INSTITUTION EXTRACTION
-            // =============================================
+            // ------------------------------------------------------------
+            // B. INSTITUTION EXTRACTION (Affiliation / College / University)
+            // ------------------------------------------------------------
+
             const instPatterns = [
-                // Pattern: "of Dr.N.G.P Institute of Technology" or "of Dr N.G.P Institute of Technology"
-                /(?:of|from)\s+((?:Dr\.?\s*)?[A-Z]\.?[A-Z]\.?[A-Z]\.?[A-Z]?\.?\s*(?:Institute|College|University|Polytechnic)(?:\s+of\s+[A-Za-z\s]+)?)/i,
-                // Pattern: "Dr.N.G.P. Institute of Technology"
-                /\b((?:Dr\.?\s*)?(?:[A-Z]\.?\s*){2,4}(?:Institute|College|University)(?:\s+of\s+[A-Za-z]+)?)/i,
-                // Pattern: standard institution names
-                /(?:of|from)\s+((?:Dr\.?\s*)?[A-Z][A-Za-z\.\s]+?(?:Institute|College|University|Polytechnic)(?:\s+of\s+[A-Za-z\s]+)?)/i,
-                // Pattern: "student of INSTITUTION"
-                /student\s+of\s+([A-Z][A-Za-z\.\s]+?(?:Institute|College|University|Technology))/i
+                // Pattern 1: "of / from Dr.N.G.P. Institute of Technology"
+                /(?:student\s+of|studying\s+(?:in|at)|of|from)\s+((?:Dr\.?\s*)?[A-Z0-9\.\s\&\'\-]{2,50}?(?:Institute|College|University|Polytechnic|Academy|School|Faculty|Campus)(?:\s+of\s+[A-Za-z0-9\s\&]+)?)/i,
+
+                // Pattern 2: "Dr.N.G.P. Institute of Technology" or "PSG College of Technology"
+                /\b((?:Dr\.?\s*)?(?:[A-Z]\.?\s*){1,5}(?:Institute|College|University|Polytechnic|Academy)(?:\s+of\s+[A-Za-z0-9\s\&]+)?)/i,
+
+                // Pattern 3: Header institution in ALL CAPS (e.g., "PSG COLLEGE OF TECHNOLOGY")
+                /\b([A-Z0-9\.\s\&\'\-]{3,45}\s+(?:COLLEGE|INSTITUTE|UNIVERSITY|POLYTECHNIC|ACADEMY)(?:\s+OF\s+[A-Z0-9\s\&]+)?)\b/,
+
+                // Pattern 4: Generic "student of XYZ"
+                /student\s+of\s+([A-Z][A-Za-z0-9\.\s\&\'\-]{3,60})/i
             ];
-            for (const pattern of instPatterns) {
-                const match = fullText.match(pattern);
+
+            for (const pat of instPatterns) {
+                const match = fullText.match(pat);
                 if (match && match[1]) {
-                    // Skip if it contains certificate type words
-                    if (/appreciation|participation|completion|achievement/i.test(match[1])) continue;
-                    inst = match[1].trim();
-                    // Clean up trailing words
-                    inst = inst.replace(/\s+(has|for|on|in|the|,)\s*$/i, '').trim();
-                    // Remove trailing comma or period
-                    inst = inst.replace(/[,.]$/, '').trim();
-                    if (inst.length > 60) inst = inst.substring(0, 60);
-                    if (inst.length > 5) break; // Only accept if reasonable length
-                }
-            }
-
-            // =============================================
-            // ORGANIZER EXTRACTION  
-            // =============================================
-            // Pattern 1: "conducted at/by" with full institution name
-            const conductedMatch = fullText.match(/conducted\s+(?:at|by)\s+((?:Dr\.?\s*)?(?:[A-Z]\.?\s*)*[A-Z][A-Za-z\.\s]+?(?:College|University|Institute|Technology)(?:\s+of\s+[A-Za-z]+)?)/i);
-            if (conductedMatch) {
-                organizer = conductedMatch[1].trim();
-                organizer = organizer.replace(/\s+(on|from|in|the|during)\s*$/i, '').trim();
-            }
-
-            // Pattern 2: "organized by" or "organised by"
-            if (!organizer) {
-                const orgMatch = fullText.match(/(?:organized|organised)\s+by\s+(?:the\s+)?((?:Centre|Center|Department)\s+(?:for|of)\s+[A-Za-z\s&]+?)(?:,|\.|in\s+association)/i);
-                if (orgMatch) {
-                    organizer = orgMatch[1].trim();
-                }
-            }
-
-            // Pattern 3: "Centre for IoT" or similar with full context
-            if (!organizer) {
-                const centreMatch = fullText.match(/((?:Centre|Center)\s+for\s+(?:Internet\s+of\s+Things|IoT|[A-Za-z\s&]+?))\s*(?:,|\(|in\s+association)/i);
-                if (centreMatch) {
-                    organizer = centreMatch[1].trim();
-                }
-            }
-
-            // Pattern 4: Look for full organization with campus info
-            if (!organizer) {
-                const campusMatch = fullText.match(/((?:C-IoT|Centre\s+for\s+[^,]+),?\s*(?:MIT\s+Campus|[A-Z]+\s+Campus)[^,]*)/i);
-                if (campusMatch) {
-                    organizer = campusMatch[1].trim();
-                }
-            }
-
-            // Pattern 5: Extract institution name from header (PSG COLLEGE OF TECHNOLOGY, etc.)
-            if (!organizer) {
-                const headerMatch = fullText.match(/\b([A-Z]{2,}(?:\s+[A-Z]+)*\s+(?:COLLEGE|INSTITUTE|UNIVERSITY)\s+OF\s+[A-Z]+)\b/);
-                if (headerMatch) {
-                    organizer = headerMatch[1].trim();
-                    if (organizer.length > 50) organizer = organizer.substring(0, 50);
-                }
-            }
-
-            // =============================================
-            // DEGREE/PROGRAM EXTRACTION
-            // =============================================
-            // Pattern 1: Event name from "edition of AXIOS" etc.
-            const eventMatch = fullText.match(/edition\s+of\s+([A-Z][A-Z0-9]+)/i);
-            if (eventMatch) {
-                degree = `Participation - ${eventMatch[1]}`;
-            }
-
-            // Pattern 2: Full workshop/training name with topic
-            if (!degree) {
-                const workshopMatch = fullText.match(/((?:FIVE|FOUR|THREE|TWO|ONE|\d+)[\s-]?DAY[S]?\s+(?:HANDS[\s-]?ON\s+)?(?:WORKSHOP|TRAINING|COURSE|BOOTCAMP)\s+ON\s+[A-Za-z\s\-&"]+?)(?:\s*organized|\s*conducted|\s*,|\s*"|\s*by)/i);
-                if (workshopMatch) {
-                    degree = workshopMatch[1].trim();
-                    // Clean up trailing quotes or garbage
-                    degree = degree.replace(/["']$/, '').trim();
-                }
-            }
-
-            // Pattern 3: Workshop with "IOT DEVICE PROGRAMMING" or similar topic
-            if (!degree) {
-                const topicMatch = fullText.match(/(?:WORKSHOP|TRAINING|BOOTCAMP|COURSE)\s+ON\s+"?([A-Z][A-Z\s&-]+)"?/i);
-                if (topicMatch) {
-                    degree = `Workshop on ${topicMatch[1].trim()}`;
-                }
-            }
-
-            // Pattern 4: Look for BOOTCAMP, WORKSHOP, etc. with context
-            if (!degree) {
-                const bootcampMatch = fullText.match(/(INTERNET\s+OF\s+THINGS|IOT|AI|ML|MACHINE\s+LEARNING|DATA\s+SCIENCE|WEB\s+DEVELOPMENT|[A-Z\s]+)\s*(?:BOOTCAMP|WORKSHOP|TRAINING)/i);
-                if (bootcampMatch) {
-                    degree = `${bootcampMatch[1].trim()} Workshop`;
-                }
-            }
-
-            // Pattern 5: Certificate type with event name
-            if (!degree) {
-                const certTypeMatch = fullText.match(/CERTIFICATE\s+OF\s+(PARTICIPATION|APPRECIATION|COMPLETION|ACHIEVEMENT|EXCELLENCE|MERIT)/i);
-                if (certTypeMatch) {
-                    // Try to append event name if found
-                    const eventName = fullText.match(/(?:edition\s+of\s+|event\s+|fest\s+)([A-Z][A-Z0-9]+)/i);
-                    if (eventName) {
-                        degree = `Certificate of ${certTypeMatch[1]} - ${eventName[1]}`;
-                    } else {
-                        degree = `Certificate of ${certTypeMatch[1]}`;
+                    const cleaned = cleanInstitution(match[1]);
+                    if (cleaned.length >= 6 && !/certificate|participation|appreciation|completion|achievement/i.test(cleaned)) {
+                        institution = cleaned;
+                        break;
                     }
                 }
             }
 
-            // Pattern 6: Simpler fallbacks with more context
+            // Header scan fallback: Top 5 lines often contain the main institution
+            if (!institution) {
+                for (let i = 0; i < Math.min(lines.length, 6); i++) {
+                    const line = lines[i];
+                    if (/(?:College|University|Institute|Polytechnic|Academy|School|Campus)/i.test(line)) {
+                        const cleaned = cleanInstitution(line);
+                        if (cleaned.length >= 6 && !/certificate|this is to certify|presents/i.test(cleaned)) {
+                            institution = cleaned;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // ------------------------------------------------------------
+            // C. ORGANIZER / DEPARTMENT EXTRACTION
+            // ------------------------------------------------------------
+
+            const orgPatterns = [
+                // Pattern 1: "conducted at/by [Institution/Department]"
+                /(?:conducted|organized|organised|hosted|sponsored|coordinated)\s+(?:at|by)\s+(?:the\s+)?((?:Dr\.?\s*)?[A-Za-z0-9\.\s\&\,\'\-]{3,60}?(?:College|University|Institute|Technology|Department|Centre|Center|Association|Club|Division|School)(?:\s+of\s+[A-Za-z0-9\s\&]+)?)/i,
+
+                // Pattern 2: "Department of Computer Science..." / "Centre for IoT..."
+                /((?:Department|Dept\.?|Centre|Center|Division|School)\s+(?:of|for)\s+[A-Za-z0-9\s\&\-\/]{3,50})/i,
+
+                // Pattern 3: "Centre for IoT, MIT Campus..."
+                /((?:C-IoT|Centre\s+for\s+[^,]+),?\s*(?:MIT\s+Campus|[A-Z0-9\s]+\s+Campus)[^,\n]*)/i,
+
+                // Pattern 4: "in association with XYZ"
+                /(?:in\s+association\s+with|in\s+collaboration\s+with)\s+([A-Za-z0-9\s\&\,\.\-]+)/i
+            ];
+
+            for (const pat of orgPatterns) {
+                const match = fullText.match(pat);
+                if (match && match[1]) {
+                    const cleaned = cleanString(match[1])
+                        .replace(/\s+(?:on|from|in|the|during|held|dated)\s*$/i, '')
+                        .replace(/[,.]$/, '')
+                        .trim();
+                    if (cleaned.length >= 4) {
+                        organizer = cleaned;
+                        break;
+                    }
+                }
+            }
+
+            // ------------------------------------------------------------
+            // D. DEGREE / COURSE / EVENT / CERTIFICATE TITLE EXTRACTION
+            // ------------------------------------------------------------
+
+            const degreePatterns = [
+                // Pattern 1: "edition of AXIOS" or similar event name
+                /(?:edition\s+of|event\s+named|fest\s+titled)\s+([A-Z0-9\s\-\&]{2,30})/i,
+
+                // Pattern 2: Detailed workshop / training format: "FIVE-DAY HANDS-ON WORKSHOP ON IOT DEVICE PROGRAMMING"
+                /((?:FIVE|FOUR|THREE|TWO|ONE|\d+)[\s-]?DAY[S]?\s+(?:HANDS[\s-]?ON\s+)?(?:WORKSHOP|TRAINING|COURSE|BOOTCAMP|SEMINAR|CONFERENCE|FACULTY DEVELOPMENT PROGRAM|FDP|INTERNSHIP|HACKATHON)\s+(?:ON|IN|TITLED)\s+["']?([A-Za-z0-9\s\-&:\.\,\'\(\)]+?)["']?)(?=\s+(?:organized|conducted|held|from|on|at|by|\,|\.|\n|$))/i,
+
+                // Pattern 3: "WORKSHOP / TRAINING / BOOTCAMP ON [TOPIC]"
+                /(?:(?:HANDS[\s-]?ON\s+)?(?:WORKSHOP|TRAINING|BOOTCAMP|COURSE|SEMINAR|CONFERENCE|WEBINAR|HACKATHON|INTERNSHIP|CERTIFICATION)\s+(?:ON|IN|TITLED)\s+["']?([A-Za-z0-9\s\-&:\.\,\'\(\)]+?)["']?)/i,
+
+                // Pattern 4: Academic Degree "Bachelor of Technology in Computer Science", "Master of Business Administration"
+                /(?:Degree\s+of\s+)?\b((?:Bachelor|Master|Doctor|Diploma)\s+of\s+[A-Za-z0-9\s\&]+(?:\s+in\s+[A-Za-z0-9\s\&]+)?)/i,
+
+                // Pattern 5: Degree Acronyms "B.E. Computer Science", "B.Tech Information Technology"
+                /\b((?:B\.?E\.?|B\.?Tech\.?|M\.?E\.?|M\.?Tech\.?|B\.?Sc\.?|M\.?Sc\.?|B\.?Com\.?|M\.?Com\.?|B\.?B\.?A\.?|M\.?B\.?A\.?|B\.?C\.?A\.?|M\.?C\.?A\.?|Ph\.?D\.?)\s*(?:in\s+[A-Za-z0-9\s\&]+)?)\b/i,
+
+                // Pattern 6: "for successfully completing / participating in the [EVENT/TOPIC]"
+                /(?:for\s+(?:successfully\s+)?(?:participating|completing|attending|presenting\s+(?:a\s+paper\s+on)?)\s+(?:in\s+)?(?:the\s+)?(?:event\s+)?["']?([A-Za-z0-9\s\-&:\.\,\'\(\)]+?)["']?)(?=\s+(?:held|organized|conducted|from|on|at|dated|\,|\.|\n|$))/i,
+
+                // Pattern 7: "CERTIFICATE OF PARTICIPATION / APPRECIATION / COMPLETION"
+                /(CERTIFICATE\s+OF\s+(?:PARTICIPATION|APPRECIATION|COMPLETION|ACHIEVEMENT|EXCELLENCE|MERIT|RECOGNITION|HONOUR|ATTENDANCE))/i
+            ];
+
+            for (const pat of degreePatterns) {
+                const match = fullText.match(pat);
+                if (match) {
+                    let matchedDegree = match[1] || match[0];
+                    if (match[2]) {
+                        matchedDegree = `${match[1]}`;
+                    }
+                    matchedDegree = cleanString(matchedDegree).replace(/["']/g, '');
+                    if (matchedDegree.length >= 4) {
+                        degree = matchedDegree;
+                        break;
+                    }
+                }
+            }
+
+            // Degree Fallbacks from keywords
             if (!degree) {
-                if (fullText.toLowerCase().includes('hands-on') && fullText.toLowerCase().includes('workshop')) {
-                    degree = "Hands-On Workshop";
-                } else if (fullText.toLowerCase().includes('workshop')) {
+                if (/hands[\s-]?on\s+workshop/i.test(fullText)) {
+                    degree = "Hands-on Workshop";
+                } else if (/workshop/i.test(fullText)) {
                     degree = "Workshop";
-                } else if (fullText.toLowerCase().includes('bootcamp')) {
+                } else if (/bootcamp/i.test(fullText)) {
                     degree = "Bootcamp";
-                } else if (fullText.toLowerCase().includes('training')) {
+                } else if (/training\s+program/i.test(fullText)) {
                     degree = "Training Program";
-                } else if (fullText.toLowerCase().includes('participation')) {
+                } else if (/internship/i.test(fullText)) {
+                    degree = "Internship";
+                } else if (/certificate\s+of\s+participation/i.test(fullText)) {
                     degree = "Certificate of Participation";
-                } else if (fullText.toLowerCase().includes('appreciation')) {
+                } else if (/certificate\s+of\s+appreciation/i.test(fullText)) {
                     degree = "Certificate of Appreciation";
+                } else if (/certificate\s+of\s+completion/i.test(fullText)) {
+                    degree = "Certificate of Completion";
                 }
             }
 
-            // Pattern 7: Register/Certificate Number (alphanumeric codes)
-            const regMatch = fullText.match(/(?:Certificate\s*No|Reg(?:ister)?\s*(?:No|Number)|ID\s*(?:No)?|Roll\s*No)[\.:]*\s*([A-Z0-9\-\/]+)/i);
-            if (regMatch) {
-                reg = regMatch[1].trim();
-            }
-            // Fallback: Look for patterns like "2025W020034" or similar
-            if (!reg) {
-                const codeMatch = fullText.match(/\b(\d{4}[A-Z]\d{5,})\b/);
-                if (codeMatch) {
-                    reg = codeMatch[1];
+            // ------------------------------------------------------------
+            // E. REGISTER / CERTIFICATE / ROLL NUMBER EXTRACTION
+            // ------------------------------------------------------------
+
+            const regPatterns = [
+                // Explicit labels: "Reg No: 2025W020034", "Certificate No: CERT-12345", "Roll No: 19BCS042"
+                /(?:Certificate\s*(?:No|Num|Number|ID|\#)?|Cert\s*ID|Reg(?:ister|istration)?\s*(?:No|Num|Number|\#)?|Roll\s*(?:No|Number|\#)?|Enrollment\s*(?:No|Number|\#)?|USN|PRN|Student\s*ID|Serial\s*(?:No|Number|\#)?|Ref\s*(?:No)?|Credential\s*ID)\s*[:\-\.\#\s]\s*([A-Z0-9\-\/\_]{3,30})/i,
+
+                // University style student codes: "2025W020034", "2021BCS042", "717821P123"
+                /\b([0-9]{2,4}[A-Z]{1,5}[0-9]{3,8})\b/,
+
+                // University register codes starting with 20: "2025W020034"
+                /\b(20\d{2}[A-Z0-9\-\/]{4,20})\b/,
+
+                // Standard certificate format: "CERT-526001" or "ID-883921"
+                /\b([A-Z]{3,6}\-[0-9]{4,10})\b/
+            ];
+
+            for (const pat of regPatterns) {
+                const match = fullText.match(pat);
+                if (match && match[1]) {
+                    const cleaned = cleanString(match[1]);
+                    if (cleaned.length >= 3 && !/college|institute|university|workshop/i.test(cleaned)) {
+                        registerNumber = cleaned;
+                        break;
+                    }
                 }
             }
 
-            // Year extraction
+            // ------------------------------------------------------------
+            // F. YEAR EXTRACTION
+            // ------------------------------------------------------------
+
             const yearMatch = fullText.match(/\b(20\d{2})\b/);
-            const year = yearMatch ? yearMatch[1] : new Date().getFullYear().toString();
+            year = yearMatch ? yearMatch[1] : new Date().getFullYear().toString();
 
-            // If empty, user will fill it.
+            // ------------------------------------------------------------
+            // G. GPA / GRADE / SCORE EXTRACTION (if applicable)
+            // ------------------------------------------------------------
+
+            const gpaPatterns = [
+                /CGPA\s*[:\=]?\s*(\d+(?:\.\d+)?(?:\s*\/\s*10)?)/i,
+                /GPA\s*[:\=]?\s*(\d+(?:\.\d+)?(?:\s*\/\s*4)?)/i,
+                /Grade\s*[:\=]?\s*([A-O\+\-]+)/i,
+                /Percentage\s*[:\=]?\s*(\d+(?:\.\d+)?\%)/i,
+                /(First\s+Class(?:\s+with\s+Distinction)?|Distinction)/i
+            ];
+
+            for (const pat of gpaPatterns) {
+                const match = fullText.match(pat);
+                if (match && match[1]) {
+                    gpa = cleanString(match[1]);
+                    break;
+                }
+            }
+
+            // ============================================================
+            // 6. RESULT PACKAGING & SUMMARY
+            // ============================================================
             const result = {
                 name: name || "",
-                registerNumber: reg || "",
-                institution: inst || "",
+                registerNumber: registerNumber || "",
+                institution: institution || "",
                 organizer: organizer || "",
                 degree: degree || "",
                 year: year,
-                gpa: ""
+                gpa: gpa || ""
             };
 
-            console.log("[OCR] Extracted fields:", result);
+            console.log("[OCR] Final Extracted Fields:", result);
 
-            if (!name || !degree) {
-                alert("OCR finished but some fields are missing. Please manually enter/correct the details.");
+            if (!name && !degree && !institution) {
+                alert("OCR finished, but could not automatically detect details with high confidence. Please verify or manually enter details in the form.");
             }
 
             return result;
 
         } catch (err) {
-            console.error("OCR Error:", err);
+            console.error("[OCR] Extraction Error:", err);
             alert("OCR Failed: " + (err.message || "Unknown Error") + "\n\nPlease manually enter the correct details in the form.");
-            return { name: "", registerNumber: "", institution: "", organizer: "", degree: "" };
+            return { name: "", registerNumber: "", institution: "", organizer: "", degree: "", year: new Date().getFullYear().toString(), gpa: "" };
         }
     }
 };
@@ -938,6 +1233,95 @@ const API = {
 // ==========================================
 
 const CertificateComparator = {
+    /**
+     * Normalize person recipient name (collapses titles, standardizes spaces/initials)
+     * e.g. "Akshay Anand M.P." -> "AKSHAY ANAND M P"
+     */
+    normalizeName: (name) => {
+        if (!name) return "";
+        return name
+            .toString()
+            .toUpperCase()
+            .replace(/^(?:MR\.?|MS\.?|MRS\.?|MISS\.?|DR\.?|PROF\.?|SHRI\.?|SMT\.?|MX\.?|MASTER)\s+/i, '')
+            .replace(/^(?:MR\.?\s*\/\s*MS\.?|MS\.?\s*\/\s*MR\.?)\s+/i, '')
+            .replace(/[\.\,\;\:\'\"\_]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    },
+
+    /**
+     * Normalize Certificate ID / Register Number strictly
+     * e.g. "CERT - 2026 / 001" -> "CERT-2026/001"
+     */
+    normalizeCertificateId: (id) => {
+        if (!id) return "";
+        return id
+            .toString()
+            .toUpperCase()
+            .replace(/\s+/g, '')
+            .replace(/[\:\#]/g, '')
+            .trim();
+    },
+
+    /**
+     * Normalize Institution name
+     * e.g. "Dr. N.G.P. Institute of Technology" -> "DR NGP INSTITUTE OF TECHNOLOGY"
+     */
+    normalizeInstitution: (inst) => {
+        if (!inst) return "";
+        return inst
+            .toString()
+            .toUpperCase()
+            .replace(/^(?:OF|FROM|AT|STUDENT OF)\s+/i, '')
+            .replace(/[\.\,\;\:\'\"\_\-\(\)]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    },
+
+    /**
+     * Normalize Course / Degree name
+     */
+    normalizeCourse: (course) => {
+        if (!course) return "";
+        return course
+            .toString()
+            .toUpperCase()
+            .replace(/[\.\,\;\:\'\"\_\-\(\)]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    },
+
+    /**
+     * Normalize Date format
+     */
+    normalizeDate: (date) => {
+        if (!date) return "";
+        const str = date.toString().trim();
+        const dMatch = str.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+        if (dMatch) {
+            const day = dMatch[1].padStart(2, '0');
+            const month = dMatch[2].padStart(2, '0');
+            const yr = dMatch[3].length === 2 ? '20' + dMatch[3] : dMatch[3];
+            return `${day}-${month}-${yr}`;
+        }
+        const yMatch = str.match(/\b(20\d{2}|19\d{2})\b/);
+        if (yMatch) return yMatch[1];
+        return str.toUpperCase().replace(/\s+/g, ' ');
+    },
+
+    /**
+     * Generate canonical deterministic representation for hashing / comparison
+     */
+    generateCanonicalData: (cert) => {
+        const name = CertificateComparator.normalizeName(cert.name || cert.studentName || cert.recipientName || "");
+        const certId = CertificateComparator.normalizeCertificateId(cert.certificateId || cert.registerNumber || cert.certificateNumber || "");
+        const institution = CertificateComparator.normalizeInstitution(cert.institution || cert.institutionName || cert.organizer || "");
+        const course = CertificateComparator.normalizeCourse(cert.course || cert.degree || cert.verifiedCertificateName || "");
+        const date = CertificateComparator.normalizeDate(cert.date || cert.year || cert.issuedAt || "");
+
+        return `NAME=${name}\nCERTIFICATE_ID=${certId}\nINSTITUTION=${institution}\nCOURSE=${course}\nDATE=${date}`;
+    },
+
     /**
      * Calculate Levenshtein distance between two strings
      * @param {string} str1 - First string
@@ -992,57 +1376,71 @@ const CertificateComparator = {
 
     /**
      * Check if two strings are similar enough (fuzzy match)
-     * Uses adaptive thresholds based on string length
+     * CRITICAL FIX: Empty string is NEVER treated as a match!
      * @param {string} str1 - First string
      * @param {string} str2 - Second string
      * @param {string} fieldType - Type of field being compared ('number', 'name', 'institution')
      * @returns {boolean} True if strings are similar enough
      */
     isFuzzyMatch: (str1, str2, fieldType = 'default') => {
+        // If either is missing/empty, it cannot match!
+        if (!str1 || !str2 || str1.toString().trim() === "" || str2.toString().trim() === "") {
+            console.log(`[CertificateComparator] Field "${fieldType}" empty or missing - match failed`);
+            return false;
+        }
+
+        const s1 = str1.toString().trim();
+        const s2 = str2.toString().trim();
+
         // Exact match
-        if (str1 === str2) return true;
+        if (s1 === s2) return true;
 
-        // Handle empty fields:
-        // - If ORIGINAL is empty, skip comparison (can't compare to nothing) - treat as match
-        // - If ORIGINAL has value but EXTRACTED is empty, OCR failed - treat as match (be lenient)
-        // - If both have values, compare them properly
-        if (!str1) {
-            console.log(`[CertificateComparator] Original field empty - skipping comparison`);
-            return true;
-        }
-        if (!str2) {
-            console.log(`[CertificateComparator] Extracted field empty (OCR missed it) - skipping comparison`);
-            return true;
-        }
+        // 1. Strict Certificate ID matching (e.g. CERT-2026-001 vs CERT-2026-999 must NOT match)
+        if (fieldType === 'number' || fieldType === 'certificate_number' || fieldType === 'certificateId') {
+            const id1 = CertificateComparator.normalizeCertificateId(s1);
+            const id2 = CertificateComparator.normalizeCertificateId(s2);
+            if (id1 === id2) return true;
 
-        // Calculate edit distance
-        const distance = CertificateComparator.levenshteinDistance(str1, str2);
-        const maxLen = Math.max(str1.length, str2.length);
-        const similarity = ((maxLen - distance) / maxLen) * 100;
+            const dist = CertificateComparator.levenshteinDistance(id1, id2);
+            const maxLen = Math.max(id1.length, id2.length);
+            const sim = maxLen === 0 ? 100 : ((maxLen - dist) / maxLen) * 100;
 
-        // Log for debugging
-        console.log(`[CertificateComparator] Field: ${fieldType}`);
-        console.log(`[CertificateComparator] Original: "${str1}" (${str1.length} chars)`);
-        console.log(`[CertificateComparator] Extracted: "${str2}" (${str2.length} chars)`);
-        console.log(`[CertificateComparator] Edit distance: ${distance}, Similarity: ${similarity.toFixed(1)}%`);
-
-        // For certificate numbers - strict matching (90%+ similarity required)
-        if (fieldType === 'number' || fieldType === 'certificate_number') {
-            const isMatch = similarity >= 90;
-            console.log(`[CertificateComparator] Certificate number match (90%+ required): ${isMatch}`);
+            // Strict: require >= 92% similarity and at most 1 char difference for minor single-glyph OCR error
+            const isMatch = sim >= 92 && dist <= 1;
+            console.log(`[CertificateComparator] Strict ID match: "${id1}" vs "${id2}" -> ${isMatch}`);
             return isMatch;
         }
 
-        // For names and other fields:
-        // Use PERCENTAGE-based matching to catch major changes like "CHANDRU T" -> "AKSHAYANAND"
-        // Require at least 75% similarity to pass
-        // This means names must be mostly the same, not completely different
-        const similarityThreshold = 75;
-        const isMatch = similarity >= similarityThreshold;
+        // 2. Person Name matching (tolerates minor spacing, initials and formatting)
+        if (fieldType === 'name' || fieldType === 'verified_certificate_name') {
+            const name1 = CertificateComparator.normalizeName(s1);
+            const name2 = CertificateComparator.normalizeName(s2);
+            if (name1 === name2) return true;
 
-        console.log(`[CertificateComparator] Similarity threshold: ${similarityThreshold}%`);
-        console.log(`[CertificateComparator] Match result: ${isMatch} (${similarity.toFixed(1)}% >= ${similarityThreshold}%)`);
+            const stripped1 = name1.replace(/\s/g, '');
+            const stripped2 = name2.replace(/\s/g, '');
+            if (stripped1 === stripped2) return true;
 
+            const nameDist = CertificateComparator.levenshteinDistance(stripped1, stripped2);
+            const nameMaxLen = Math.max(stripped1.length, stripped2.length);
+            const nameSim = nameMaxLen === 0 ? 100 : ((nameMaxLen - nameDist) / nameMaxLen) * 100;
+
+            const isMatch = nameSim >= 78;
+            console.log(`[CertificateComparator] Name match: "${name1}" vs "${name2}" -> ${isMatch} (${nameSim.toFixed(1)}%)`);
+            return isMatch;
+        }
+
+        // 3. Institution / Course / Other fields
+        const norm1 = CertificateComparator.normalizeInstitution(s1);
+        const norm2 = CertificateComparator.normalizeInstitution(s2);
+        if (norm1 === norm2) return true;
+
+        const distance = CertificateComparator.levenshteinDistance(norm1, norm2);
+        const maxLen = Math.max(norm1.length, norm2.length);
+        const similarity = maxLen === 0 ? 100 : ((maxLen - distance) / maxLen) * 100;
+
+        const isMatch = similarity >= 75;
+        console.log(`[CertificateComparator] Field "${fieldType}" match: ${isMatch} (${similarity.toFixed(1)}%)`);
         return isMatch;
     },
 
@@ -1053,14 +1451,14 @@ const CertificateComparator = {
      */
     extractFields: (certData) => {
         return {
-            certificateNumber: CertificateComparator.normalizeField(
-                certData.registerNumber || certData.certificateNumber || certData.certNo || ""
+            certificateNumber: CertificateComparator.normalizeCertificateId(
+                certData.registerNumber || certData.certificateNumber || certData.certificateId || certData.certNo || ""
             ),
-            institutionName: CertificateComparator.normalizeField(
+            institutionName: CertificateComparator.normalizeInstitution(
                 certData.institution || certData.institutionName || certData.organizer || ""
             ),
-            verifiedCertificateName: CertificateComparator.normalizeField(
-                certData.degree || certData.certificateName || certData.name || ""
+            verifiedCertificateName: CertificateComparator.normalizeName(
+                certData.name || certData.studentName || certData.degree || certData.certificateName || ""
             )
         };
     },
@@ -1551,75 +1949,72 @@ const CertificateVerifier = {
      * @returns {Object} Field comparison results
      */
     compareFields: (originalData, extractedData) => {
-        // Log the raw data for debugging
         console.log("[CertificateVerifier] Original data:", originalData);
         console.log("[CertificateVerifier] Extracted data:", extractedData);
 
         const fields = {
             certificate_number: {
-                original: originalData.certificateNumber || originalData.registerNumber || originalData.certificate_number || "",
-                extracted: extractedData.certificateNumber || extractedData.registerNumber || extractedData.certificate_number || "",
-                status: "Match"
+                original: originalData.certificateNumber || originalData.registerNumber || originalData.certificate_number || originalData.certificateId || "",
+                extracted: extractedData.certificateNumber || extractedData.registerNumber || extractedData.certificate_number || extractedData.certificateId || "",
+                status: "Pending"
             },
             institution_name: {
                 original: originalData.institutionName || originalData.institution || originalData.institution_name || "",
                 extracted: extractedData.institutionName || extractedData.institution || extractedData.institution_name || "",
-                status: "Match"
+                status: "Pending"
             },
             verified_certificate_name: {
-                // Compare recipient NAME (the person's name) - this is what forgers would edit
-                original: originalData.name || originalData.recipientName || originalData.verifiedCertificateName || "",
+                original: originalData.name || originalData.recipientName || originalData.verifiedCertificateName || originalData.studentName || "",
                 extracted: extractedData.name || extractedData.recipientName || extractedData.verifiedCertificateName || "",
-                status: "Match"
+                status: "Pending"
             }
         };
 
         let editedFields = [];
-        let comparisonDetails = []; // For debugging
+        let missingFields = [];
+        let comparisonDetails = [];
 
-        // Compare each field in order
         const comparisonOrder = ["certificate_number", "institution_name", "verified_certificate_name"];
 
         for (const fieldName of comparisonOrder) {
             const field = fields[fieldName];
-            const normalizedOriginal = CertificateComparator.normalizeField(field.original);
-            const normalizedExtracted = CertificateComparator.normalizeField(field.extracted);
+            const orig = field.original || "";
+            const extr = field.extracted || "";
 
-            // Log comparison details
-            console.log(`[CertificateVerifier] Comparing ${fieldName}:`);
-            console.log(`  Original (raw): "${field.original}"`);
-            console.log(`  Extracted (raw): "${field.extracted}"`);
-            console.log(`  Original (normalized): "${normalizedOriginal}"`);
-            console.log(`  Extracted (normalized): "${normalizedExtracted}"`);
+            if (!extr || extr.trim() === "") {
+                field.status = "Missing";
+                missingFields.push(fieldName);
+                editedFields.push(fieldName);
+                comparisonDetails.push({ field: fieldName, original: orig, extracted: extr, isMatch: false, status: "Missing" });
+                continue;
+            }
 
-            // Use fuzzy matching with field-specific rules to handle OCR inaccuracies
-            const isMatch = CertificateComparator.isFuzzyMatch(normalizedOriginal, normalizedExtracted, fieldName);
-
-            comparisonDetails.push({
-                field: fieldName,
-                original: field.original,
-                extracted: field.extracted,
-                normalizedOriginal,
-                normalizedExtracted,
-                isMatch
-            });
+            const isMatch = CertificateComparator.isFuzzyMatch(orig, extr, fieldName);
+            comparisonDetails.push({ field: fieldName, original: orig, extracted: extr, isMatch, status: isMatch ? "Match" : "Mismatch" });
 
             if (!isMatch) {
                 field.status = "Mismatch";
                 editedFields.push(fieldName);
+            } else {
+                field.status = "Match";
             }
         }
 
-        console.log("[CertificateVerifier] Comparison details:", comparisonDetails);
+        // If key information (both name & ID) could not be extracted by OCR -> UNABLE TO VERIFY
+        const hasKeyExtraction = Boolean(fields.verified_certificate_name.extracted && fields.verified_certificate_name.extracted.length > 1) ||
+                                 Boolean(fields.certificate_number.extracted && fields.certificate_number.extracted.length > 1);
+        const unableToVerify = !hasKeyExtraction || (missingFields.length >= 2);
 
         return {
             fields,
             editedFields,
-            comparisonDetails, // Include for debugging
-            allMatch: editedFields.length === 0,
-            message: editedFields.length === 0
-                ? "All fields match - Certificate is authentic"
-                : `Fields edited: ${editedFields.join(", ")}`
+            missingFields,
+            unableToVerify,
+            comparisonDetails,
+            allMatch: editedFields.length === 0 && !unableToVerify,
+            message: unableToVerify
+                ? "UNABLE TO VERIFY: Required certificate information could not be reliably extracted"
+                : (editedFields.length === 0 ? "All fields match - Certificate is authentic" : `Fields mismatched: ${editedFields.join(", ")}`)
         };
     },
 
@@ -1714,9 +2109,10 @@ const CertificateVerifier = {
 
             // Prepare original data for comparison
             const originalData = {
-                certificateNumber: originalCertificate.certificate_number || originalCertificate.certificateNumber || originalCertificate.registerNumber,
-                institutionName: originalCertificate.institution_name || originalCertificate.institutionName || originalCertificate.institution,
-                verifiedCertificateName: originalCertificate.verified_certificate_name || originalCertificate.verifiedCertificateName || originalCertificate.degree
+                certificateNumber: originalCertificate.certificate_number || originalCertificate.certificateNumber || originalCertificate.registerNumber || "",
+                institutionName: originalCertificate.institution_name || originalCertificate.institutionName || originalCertificate.institution || "",
+                verifiedCertificateName: originalCertificate.verified_certificate_name || originalCertificate.verifiedCertificateName || originalCertificate.degree || "",
+                name: originalCertificate.name || originalCertificate.studentName || originalCertificate.recipientName || originalCertificate.verifiedCertificateName || originalCertificate.verified_certificate_name || ""
             };
 
             // Compare fields
@@ -1729,7 +2125,12 @@ const CertificateVerifier = {
             };
 
             // DECISION: Determine final result
-            if (fieldResult.allMatch) {
+            if (fieldResult.unableToVerify) {
+                report.certificate_verification_report.final_result = "UNABLE TO VERIFY";
+                report.certificate_verification_report.remarks =
+                    "⚠️ UNABLE TO VERIFY: Required certificate details (Name or Certificate ID) could not be reliably extracted from the uploaded document. Please upload a clearer scan.";
+                console.log("[CertificateVerifier] RESULT: UNABLE TO VERIFY - Missing key fields");
+            } else if (fieldResult.allMatch) {
                 // Hash match + All fields match = VALID
                 report.certificate_verification_report.final_result = "VALID";
                 report.certificate_verification_report.remarks =
@@ -1740,34 +2141,11 @@ const CertificateVerifier = {
 
                 console.log("[CertificateVerifier] RESULT: VALID - All checks passed");
             } else {
-                // Check if ALL THREE fields mismatch = FAKE
-                const allFieldsMismatch = fieldResult.editedFields.length === 3;
-
-                // Build detailed mismatch info
-                let mismatchDetails = fieldResult.comparisonDetails
-                    .filter(d => !d.isMatch)
-                    .map(d => `${d.field}: DB="${d.original}" vs OCR="${d.extracted}"`)
-                    .join("; ");
-
-                if (allFieldsMismatch) {
-                    // All fields mismatch = FAKE (completely fraudulent)
-                    report.certificate_verification_report.final_result = "FAKE";
-                    report.certificate_verification_report.remarks =
-                        `❌ FAKE CERTIFICATE DETECTED: ALL fields do not match the stored records. ` +
-                        `This certificate appears to be completely fraudulent. Details: ${mismatchDetails}`;
-
-                    console.log("[CertificateVerifier] RESULT: FAKE - All fields mismatch");
-                } else {
-                    // Some fields mismatch = EDITED
-                    report.certificate_verification_report.final_result = "EDITED";
-                    report.certificate_verification_report.remarks =
-                        `⚠️ EDITED CERTIFICATE DETECTED: The following field(s) do not match: ${fieldResult.editedFields.join(", ")}. ` +
-                        `Details: ${mismatchDetails}`;
-
-                    console.log("[CertificateVerifier] RESULT: EDITED - Field mismatch detected:", fieldResult.editedFields);
-                }
-
-                console.log("[CertificateVerifier] Mismatch details:", mismatchDetails);
+                const isAllMismatch = fieldResult.editedFields.length >= 2;
+                report.certificate_verification_report.final_result = isAllMismatch ? "FAKE" : "EDITED";
+                report.certificate_verification_report.remarks =
+                    `❌ ${isAllMismatch ? "FAKE" : "EDITED"} CERTIFICATE DETECTED: The following field(s) do not match: ${fieldResult.editedFields.join(", ")}.`;
+                console.log("[CertificateVerifier] RESULT: " + report.certificate_verification_report.final_result);
             }
 
             return report;
@@ -1815,9 +2193,10 @@ const CertificateVerifier = {
 
             // Prepare original data
             const originalData = {
-                certificateNumber: originalCertificate.certificate_number || originalCertificate.certificateNumber || originalCertificate.registerNumber,
-                institutionName: originalCertificate.institution_name || originalCertificate.institutionName || originalCertificate.institution,
-                verifiedCertificateName: originalCertificate.verified_certificate_name || originalCertificate.verifiedCertificateName || originalCertificate.degree
+                certificateNumber: originalCertificate.certificate_number || originalCertificate.certificateNumber || originalCertificate.registerNumber || "",
+                institutionName: originalCertificate.institution_name || originalCertificate.institutionName || originalCertificate.institution || "",
+                verifiedCertificateName: originalCertificate.verified_certificate_name || originalCertificate.verifiedCertificateName || originalCertificate.degree || "",
+                name: originalCertificate.name || originalCertificate.studentName || originalCertificate.recipientName || originalCertificate.verifiedCertificateName || originalCertificate.verified_certificate_name || ""
             };
 
             // Compare fields
@@ -1829,25 +2208,19 @@ const CertificateVerifier = {
                 verified_certificate_name: fieldResult.fields.verified_certificate_name.status
             };
 
-            if (fieldResult.allMatch) {
+            if (fieldResult.unableToVerify) {
+                report.certificate_verification_report.final_result = "UNABLE TO VERIFY";
+                report.certificate_verification_report.remarks =
+                    "⚠️ UNABLE TO VERIFY: Required certificate details could not be reliably extracted from the uploaded document.";
+            } else if (fieldResult.allMatch) {
                 report.certificate_verification_report.final_result = "VALID";
                 report.certificate_verification_report.remarks =
-                    "✅ CERTIFICATE FIELDS VERIFIED: All extracted fields match the stored records. " +
-                    "Note: File hash verification was skipped.";
+                    "✅ CERTIFICATE FIELDS VERIFIED: All extracted fields match the stored records. (Note: File hash verification was skipped).";
             } else {
-                // Check if ALL THREE fields mismatch = FAKE
-                const allFieldsMismatch = fieldResult.editedFields.length === 3;
-
-                if (allFieldsMismatch) {
-                    report.certificate_verification_report.final_result = "FAKE";
-                    report.certificate_verification_report.remarks =
-                        `❌ FAKE CERTIFICATE DETECTED: ALL fields do not match the stored records. ` +
-                        `This certificate appears to be completely fraudulent.`;
-                } else {
-                    report.certificate_verification_report.final_result = "EDITED";
-                    report.certificate_verification_report.remarks =
-                        `⚠️ FIELD MISMATCH DETECTED: The following field(s) do not match: ${fieldResult.editedFields.join(", ")}.`;
-                }
+                const allFieldsMismatch = fieldResult.editedFields.length >= 2;
+                report.certificate_verification_report.final_result = allFieldsMismatch ? "FAKE" : "EDITED";
+                report.certificate_verification_report.remarks =
+                    `❌ ${allFieldsMismatch ? "FAKE" : "EDITED"} CERTIFICATE DETECTED: The following field(s) do not match: ${fieldResult.editedFields.join(", ")}.`;
             }
 
             return report;
@@ -1872,6 +2245,7 @@ const CertificateVerifier = {
             switch (result) {
                 case "VALID": return "var(--success)";
                 case "EDITED": return "var(--warning)";
+                case "UNABLE TO VERIFY": return "var(--warning)";
                 case "FAKE": return "var(--danger)";
                 default: return "var(--text-muted)";
             }
@@ -1881,6 +2255,7 @@ const CertificateVerifier = {
             switch (result) {
                 case "VALID": return '<i class="bx bx-check-shield" style="font-size: 2rem;"></i>';
                 case "EDITED": return '<i class="bx bx-edit" style="font-size: 2rem;"></i>';
+                case "UNABLE TO VERIFY": return '<i class="bx bx-error" style="font-size: 2rem;"></i>';
                 case "FAKE": return '<i class="bx bx-shield-x" style="font-size: 2rem;"></i>';
                 default: return '<i class="bx bx-loader-alt bx-spin" style="font-size: 2rem;"></i>';
             }
